@@ -36,9 +36,8 @@ require (
 	github.com/owenrumney/go-sarif/v2 v2.1.1
 	github.com/package-url/packageurl-go v0.1.1-0.20220203205134-d70459300c8a
 	github.com/samber/lo v1.19.0
-	github.com/spf13/afero v1.8.1 // indirect
 	github.com/stretchr/testify v1.7.1
-	github.com/testcontainers/testcontainers-go v0.12.0
+	github.com/testcontainers/testcontainers-go v0.13.0
 	github.com/twitchtv/twirp v8.1.2+incompatible
 	github.com/urfave/cli/v2 v2.5.1
 	go.uber.org/zap v1.21.0
@@ -238,6 +237,8 @@ require (
 require gopkg.in/yaml.v2 v2.4.0
 
 require github.com/aquasecurity/trivy-kubernetes v0.1.0
+
+require github.com/cenkalti/backoff/v4 v4.1.2 // indirect
 
 // To resolve CVE-2022-23648
 replace github.com/containerd/containerd v1.5.9 => github.com/containerd/containerd v1.5.10
