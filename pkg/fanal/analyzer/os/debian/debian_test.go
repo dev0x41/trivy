@@ -5,13 +5,11 @@ import (
 	"os"
 	"testing"
 
-	aos "github.com/aquasecurity/trivy/pkg/fanal/analyzer/os"
-	"github.com/aquasecurity/trivy/pkg/fanal/types"
-
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
 	"github.com/aquasecurity/trivy/pkg/fanal/analyzer"
+	"github.com/aquasecurity/trivy/pkg/fanal/types"
 )
 
 func Test_debianOSAnalyzer_Analyze(t *testing.T) {
@@ -25,8 +23,8 @@ func Test_debianOSAnalyzer_Analyze(t *testing.T) {
 			name:      "happy path with debian 9",
 			inputFile: "testdata/debian_9/etc/debian_version",
 			want: &analyzer.AnalysisResult{
-				OS: &types.OS{
-					Family: aos.Debian,
+				OS: types.OS{
+					Family: types.Debian,
 					Name:   "9.8",
 				},
 			},
@@ -35,8 +33,8 @@ func Test_debianOSAnalyzer_Analyze(t *testing.T) {
 			name:      "happy path with debian sid",
 			inputFile: "testdata/debian_sid/etc/debian_version",
 			want: &analyzer.AnalysisResult{
-				OS: &types.OS{
-					Family: aos.Debian,
+				OS: types.OS{
+					Family: types.Debian,
 					Name:   "buster/sid",
 				},
 			},
@@ -61,7 +59,7 @@ func Test_debianOSAnalyzer_Analyze(t *testing.T) {
 				Content:  f,
 			})
 			if tt.wantErr != "" {
-				require.NotNil(t, err)
+				require.Error(t, err)
 				assert.Contains(t, err.Error(), tt.wantErr)
 				return
 			} else {

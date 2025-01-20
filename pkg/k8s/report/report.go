@@ -1,44 +1,48 @@
 package report
 
 import (
+	"errors"
 	"fmt"
 	"io"
+	"slices"
 	"strings"
 
-	"golang.org/x/exp/slices"
-
-	"golang.org/x/exp/maps"
-	"golang.org/x/xerrors"
+	"github.com/samber/lo"
 
 	dbTypes "github.com/aquasecurity/trivy-db/pkg/types"
 	"github.com/aquasecurity/trivy-kubernetes/pkg/artifacts"
 	ftypes "github.com/aquasecurity/trivy/pkg/fanal/types"
-
+	"github.com/aquasecurity/trivy/pkg/log"
+	"github.com/aquasecurity/trivy/pkg/sbom/core"
 	"github.com/aquasecurity/trivy/pkg/types"
 )
 
 const (
-	allReport     = "all"
-	summaryReport = "summary"
+	AllReport     = "all"
+	SummaryReport = "summary"
 
-	tableFormat = "table"
-	jsonFormat  = "json"
+	workloadComponent = "workload"
+	infraComponent    = "infra"
+	infraNamespace    = "kube-system"
 )
 
 type Option struct {
-	Format        string
+	Format        types.Format
 	Report        string
 	Output        io.Writer
 	Severities    []dbTypes.Severity
 	ColumnHeading []string
+	Scanners      types.Scanners
+	APIVersion    string
 }
 
 // Report represents a kubernetes scan report
 type Report struct {
-	SchemaVersion     int `json:",omitempty"`
-	ClusterName       string
-	Vulnerabilities   []Resource `json:",omitempty"`
-	Misconfigurations []Resource `json:",omitempty"`
+	SchemaVersion int `json:",omitempty"`
+	ClusterName   string
+	Resources     []Resource `json:",omitempty"`
+	BOM           *core.BOM  `json:"-"`
+	name          string
 }
 
 // ConsolidatedReport represents a kubernetes scan report with consolidated findings
@@ -53,10 +57,9 @@ type Resource struct {
 	Namespace string `json:",omitempty"`
 	Kind      string
 	Name      string
-	// TODO(josedonizetti): should add metadata? per report? per Result?
-	// Metadata  Metadata `json:",omitempty"`
-	Results types.Results `json:",omitempty"`
-	Error   string        `json:",omitempty"`
+	Metadata  []types.Metadata `json:",omitempty"`
+	Results   types.Results    `json:",omitempty"`
+	Error     string           `json:",omitempty"`
 
 	// original report
 	Report types.Report `json:"-"`
@@ -68,18 +71,11 @@ func (r Resource) fullname() string {
 
 // Failed returns whether the k8s report includes any vulnerabilities or misconfigurations
 func (r Report) Failed() bool {
-	for _, r := range r.Vulnerabilities {
-		if r.Results.Failed() {
+	for _, v := range r.Resources {
+		if v.Results.Failed() {
 			return true
 		}
 	}
-
-	for _, r := range r.Misconfigurations {
-		if r.Results.Failed() {
-			return true
-		}
-	}
-
 	return false
 }
 
@@ -90,21 +86,35 @@ func (r Report) consolidate() ConsolidatedReport {
 	}
 
 	index := make(map[string]Resource)
-
-	for _, m := range r.Misconfigurations {
-		index[m.fullname()] = m
+	var vulnerabilities []Resource
+	for _, m := range r.Resources {
+		if vulnerabilitiesOrSecretResource(m) {
+			vulnerabilities = append(vulnerabilities, m)
+		}
+		if misconfigsResource(m) {
+			res, ok := index[m.fullname()]
+			index[m.fullname()] = m
+			if ok {
+				index[m.fullname()].Results[0].Misconfigurations = append(index[m.fullname()].Results[0].Misconfigurations, res.Results[0].Misconfigurations...)
+			}
+		}
 	}
 
-	for _, v := range r.Vulnerabilities {
+	for _, v := range vulnerabilities {
 		key := v.fullname()
 
-		if r, ok := index[key]; ok {
+		if res, ok := index[key]; ok {
+			// Combine metadata
+			metadata := lo.UniqBy(append(res.Metadata, v.Metadata...), func(x types.Metadata) string {
+				return x.ImageID
+			})
 			index[key] = Resource{
-				Namespace: r.Namespace,
-				Kind:      r.Kind,
-				Name:      r.Name,
-				Results:   append(r.Results, v.Results...),
-				Error:     r.Error,
+				Namespace: res.Namespace,
+				Kind:      res.Kind,
+				Name:      res.Name,
+				Metadata:  metadata,
+				Results:   append(res.Results, v.Results...),
+				Error:     res.Error,
 			}
 
 			continue
@@ -113,7 +123,7 @@ func (r Report) consolidate() ConsolidatedReport {
 		index[key] = v
 	}
 
-	consolidated.Findings = maps.Values(index)
+	consolidated.Findings = lo.Values(index)
 
 	return consolidated
 }
@@ -123,68 +133,114 @@ type Writer interface {
 	Write(Report) error
 }
 
-// Write writes the results in the give format
-func Write(report Report, option Option, securityChecks []string) error {
-	switch option.Format {
-	case jsonFormat:
-		jwriter := JSONWriter{Output: option.Output, Report: option.Report}
-		return jwriter.Write(report)
-	case tableFormat:
-		workloadReport, rbacReport := separateMisConfigRoleAssessment(report, securityChecks)
-		WorkloadWriter := &TableWriter{
-			Output:        option.Output,
-			Report:        option.Report,
-			Severities:    option.Severities,
-			ColumnHeading: ColumnHeading(securityChecks, WorkloadColumns()),
-		}
-		err := WorkloadWriter.Write(workloadReport)
-		if err != nil {
-			return err
-		}
-		rbacWriter := &TableWriter{
-			Output:        option.Output,
-			Report:        option.Report,
-			Severities:    option.Severities,
-			ColumnHeading: ColumnHeading(securityChecks, RoleColumns()),
-		}
-		return rbacWriter.Write(rbacReport)
-	default:
-		return xerrors.Errorf(`unknown format %q. Use "json" or "table"`, option.Format)
-	}
+type reports struct {
+	Report  Report
+	Columns []string
 }
 
-func separateMisConfigRoleAssessment(k8sReport Report, securityChecks []string) (Report, Report) {
-	workloadMisconfig := make([]Resource, 0)
-	rbacAssessment := make([]Resource, 0)
-	for _, misConfig := range k8sReport.Misconfigurations {
-		if slices.Contains(securityChecks, types.SecurityCheckRbac) && rbacResource(misConfig) {
-			rbacAssessment = append(rbacAssessment, misConfig)
-		} else {
-			if slices.Contains(securityChecks, types.SecurityCheckConfig) && !rbacResource(misConfig) {
-				workloadMisconfig = append(workloadMisconfig, misConfig)
+// SeparateMisconfigReports returns 3 reports based on scanners and components flags,
+// - misconfiguration report
+// - rbac report
+// - infra checks report
+func SeparateMisconfigReports(k8sReport Report, scanners types.Scanners) []reports {
+
+	var workloadMisconfig, infraMisconfig, rbacAssessment, workloadVulnerabilities, infraVulnerabilities, workloadResource []Resource
+	for _, resource := range k8sReport.Resources {
+		switch {
+		case vulnerabilitiesOrSecretResource(resource) && !infraResource(resource):
+			if resource.Namespace == infraNamespace || nodeInfoResource(resource) {
+				infraVulnerabilities = append(infraVulnerabilities, nodeKind(resource))
+			} else {
+				workloadVulnerabilities = append(workloadVulnerabilities, resource)
 			}
+		case scanners.Enabled(types.RBACScanner) && rbacResource(resource):
+			rbacAssessment = append(rbacAssessment, resource)
+		case infraResource(resource):
+			infraMisconfig = append(infraMisconfig, nodeKind(resource))
+		case scanners.Enabled(types.MisconfigScanner) &&
+			!rbacResource(resource):
+			workloadMisconfig = append(workloadMisconfig, resource)
 		}
 	}
-	return Report{
-			SchemaVersion:     0,
-			ClusterName:       k8sReport.ClusterName,
-			Vulnerabilities:   k8sReport.Vulnerabilities,
-			Misconfigurations: workloadMisconfig,
-		}, Report{
-			SchemaVersion:     0,
-			ClusterName:       k8sReport.ClusterName,
-			Misconfigurations: rbacAssessment,
+
+	var r []reports
+	workloadResource = append(workloadResource, workloadVulnerabilities...)
+	workloadResource = append(workloadResource, workloadMisconfig...)
+	if shouldAddToReport(scanners) {
+		workloadReport := Report{
+			SchemaVersion: 0,
+			ClusterName:   k8sReport.ClusterName,
+			Resources:     workloadResource,
+			name:          "Workload Assessment",
 		}
+		r = append(r, reports{
+			Report:  workloadReport,
+			Columns: WorkloadColumns(),
+		})
+
+	}
+	infraMisconfig = append(infraMisconfig, infraVulnerabilities...)
+	if shouldAddToReport(scanners) {
+		r = append(r, reports{
+			Report: Report{
+				SchemaVersion: 0,
+				ClusterName:   k8sReport.ClusterName,
+				Resources:     infraMisconfig,
+				name:          "Infra Assessment",
+			},
+			Columns: InfraColumns(),
+		})
+	}
+
+	if scanners.Enabled(types.RBACScanner) {
+		r = append(r, reports{
+			Report: Report{
+				SchemaVersion: 0,
+				ClusterName:   k8sReport.ClusterName,
+				Resources:     rbacAssessment,
+				name:          "RBAC Assessment",
+			},
+			Columns: RoleColumns(),
+		})
+	}
+
+	return r
 }
 
 func rbacResource(misConfig Resource) bool {
-	return misConfig.Kind == "Role" || misConfig.Kind == "RoleBinding" || misConfig.Kind == "ClusterRole" || misConfig.Kind == "ClusterRoleBinding"
+	return slices.Contains([]string{
+		"Role",
+		"RoleBinding",
+		"ClusterRole",
+		"ClusterRoleBinding",
+	}, misConfig.Kind)
+}
+
+func infraResource(misConfig Resource) bool {
+	return !rbacResource(misConfig) && (misConfig.Namespace == infraNamespace) || nodeInfoResource(misConfig)
 }
 
 func CreateResource(artifact *artifacts.Artifact, report types.Report, err error) Resource {
-	results := make([]types.Result, 0, len(report.Results))
+	r := createK8sResource(artifact, report.Results)
+
+	r.Metadata = []types.Metadata{report.Metadata}
+	r.Report = report
+	// if there was any error during the scan
+	if err != nil {
+		r.Error = err.Error()
+	}
+
+	return r
+}
+
+func nodeInfoResource(nodeInfo Resource) bool {
+	return nodeInfo.Kind == "NodeInfo" || nodeInfo.Kind == "NodeComponents"
+}
+
+func createK8sResource(artifact *artifacts.Artifact, scanResults types.Results) Resource {
+	results := make([]types.Result, 0, len(scanResults))
 	// fix target name
-	for _, result := range report.Results {
+	for _, result := range scanResults {
 		// if resource is a kubernetes file fix the target name,
 		// to avoid showing the temp file that was removed.
 		if result.Type == ftypes.Kubernetes {
@@ -197,14 +253,48 @@ func CreateResource(artifact *artifacts.Artifact, report types.Report, err error
 		Namespace: artifact.Namespace,
 		Kind:      artifact.Kind,
 		Name:      artifact.Name,
+		Metadata:  []types.Metadata{},
 		Results:   results,
-		Report:    report,
-	}
-
-	// if there was any error during the scan
-	if err != nil {
-		r.Error = err.Error()
+		Report: types.Report{
+			Results:      results,
+			ArtifactName: artifact.Name,
+		},
 	}
 
 	return r
+}
+
+func (r Report) PrintErrors() {
+	for _, resource := range r.Resources {
+		if resource.Error != "" {
+			log.Error("Error during vulnerabilities or misconfiguration scan", log.Err(errors.New(resource.Error)))
+		}
+	}
+}
+
+func shouldAddToReport(scanners types.Scanners) bool {
+	return scanners.AnyEnabled(
+		types.MisconfigScanner,
+		types.VulnerabilityScanner,
+		types.SecretScanner)
+}
+
+func vulnerabilitiesOrSecretResource(resource Resource) bool {
+	for _, result := range resource.Results {
+		if len(result.Vulnerabilities) > 0 || len(resource.Results[0].Secrets) > 0 {
+			return true
+		}
+	}
+	return false
+}
+
+func misconfigsResource(resource Resource) bool {
+	return len(resource.Results) > 0 && len(resource.Results[0].Misconfigurations) > 0
+}
+
+func nodeKind(resource Resource) Resource {
+	if nodeInfoResource(resource) {
+		resource.Kind = "Node"
+	}
+	return resource
 }

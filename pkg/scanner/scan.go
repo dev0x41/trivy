@@ -6,11 +6,14 @@ import (
 	"github.com/google/wire"
 	"golang.org/x/xerrors"
 
+	"github.com/aquasecurity/trivy/pkg/cache"
+	"github.com/aquasecurity/trivy/pkg/clock"
 	"github.com/aquasecurity/trivy/pkg/fanal/artifact"
 	aimage "github.com/aquasecurity/trivy/pkg/fanal/artifact/image"
 	flocal "github.com/aquasecurity/trivy/pkg/fanal/artifact/local"
-	"github.com/aquasecurity/trivy/pkg/fanal/artifact/remote"
+	"github.com/aquasecurity/trivy/pkg/fanal/artifact/repo"
 	"github.com/aquasecurity/trivy/pkg/fanal/artifact/sbom"
+	"github.com/aquasecurity/trivy/pkg/fanal/artifact/vm"
 	"github.com/aquasecurity/trivy/pkg/fanal/image"
 	ftypes "github.com/aquasecurity/trivy/pkg/fanal/types"
 	"github.com/aquasecurity/trivy/pkg/log"
@@ -26,6 +29,11 @@ import (
 
 // StandaloneSuperSet is used in the standalone mode
 var StandaloneSuperSet = wire.NewSet(
+	// Cache
+	cache.New,
+	wire.Bind(new(cache.ArtifactCache), new(cache.Cache)),
+	wire.Bind(new(cache.LocalArtifactCache), new(cache.Cache)),
+
 	local.SuperSet,
 	wire.Bind(new(Driver), new(local.Scanner)),
 	NewScanner,
@@ -33,7 +41,6 @@ var StandaloneSuperSet = wire.NewSet(
 
 // StandaloneDockerSet binds docker dependencies
 var StandaloneDockerSet = wire.NewSet(
-	wire.Value([]image.Option(nil)), // optional functions
 	image.NewContainerImage,
 	aimage.NewArtifact,
 	StandaloneSuperSet,
@@ -48,13 +55,13 @@ var StandaloneArchiveSet = wire.NewSet(
 
 // StandaloneFilesystemSet binds filesystem dependencies
 var StandaloneFilesystemSet = wire.NewSet(
-	flocal.NewArtifact,
+	flocal.ArtifactSet,
 	StandaloneSuperSet,
 )
 
 // StandaloneRepositorySet binds repository dependencies
 var StandaloneRepositorySet = wire.NewSet(
-	remote.NewArtifact,
+	repo.ArtifactSet,
 	StandaloneSuperSet,
 )
 
@@ -64,12 +71,22 @@ var StandaloneSBOMSet = wire.NewSet(
 	StandaloneSuperSet,
 )
 
+// StandaloneVMSet binds vm dependencies
+var StandaloneVMSet = wire.NewSet(
+	vm.ArtifactSet,
+	StandaloneSuperSet,
+)
+
 /////////////////
 // Client/Server
 /////////////////
 
 // RemoteSuperSet is used in the client mode
 var RemoteSuperSet = wire.NewSet(
+	// Cache
+	cache.NewRemoteCache,
+	wire.Bind(new(cache.ArtifactCache), new(*cache.RemoteCache)), // No need for LocalArtifactCache
+
 	client.NewScanner,
 	wire.Value([]client.Option(nil)),
 	wire.Bind(new(Driver), new(client.Scanner)),
@@ -78,7 +95,13 @@ var RemoteSuperSet = wire.NewSet(
 
 // RemoteFilesystemSet binds filesystem dependencies for client/server mode
 var RemoteFilesystemSet = wire.NewSet(
-	flocal.NewArtifact,
+	flocal.ArtifactSet,
+	RemoteSuperSet,
+)
+
+// RemoteRepositorySet binds repository dependencies for client/server mode
+var RemoteRepositorySet = wire.NewSet(
+	repo.ArtifactSet,
 	RemoteSuperSet,
 )
 
@@ -88,10 +111,15 @@ var RemoteSBOMSet = wire.NewSet(
 	RemoteSuperSet,
 )
 
+// RemoteVMSet binds vm dependencies for client/server mode
+var RemoteVMSet = wire.NewSet(
+	vm.ArtifactSet,
+	RemoteSuperSet,
+)
+
 // RemoteDockerSet binds remote docker dependencies
 var RemoteDockerSet = wire.NewSet(
 	aimage.NewArtifact,
-	wire.Value([]image.Option(nil)), // optional functions
 	image.NewContainerImage,
 	RemoteSuperSet,
 )
@@ -112,12 +140,15 @@ type Scanner struct {
 // Driver defines operations of scanner
 type Driver interface {
 	Scan(ctx context.Context, target, artifactKey string, blobKeys []string, options types.ScanOptions) (
-		results types.Results, osFound *ftypes.OS, err error)
+		results types.Results, osFound ftypes.OS, err error)
 }
 
 // NewScanner is the factory method of Scanner
 func NewScanner(driver Driver, ar artifact.Artifact) Scanner {
-	return Scanner{driver: driver, artifact: ar}
+	return Scanner{
+		driver:   driver,
+		artifact: ar,
+	}
 }
 
 // ScanArtifact scans the artifacts and returns results
@@ -128,7 +159,8 @@ func (s Scanner) ScanArtifact(ctx context.Context, options types.ScanOptions) (t
 	}
 	defer func() {
 		if err := s.artifact.Clean(artifactInfo); err != nil {
-			log.Logger.Warnf("Failed to clean the artifact %q: %v", artifactInfo.Name, err)
+			log.Warn("Failed to clean the artifact",
+				log.String("artifact", artifactInfo.Name), log.Err(err))
 		}
 	}()
 
@@ -137,22 +169,22 @@ func (s Scanner) ScanArtifact(ctx context.Context, options types.ScanOptions) (t
 		return types.Report{}, xerrors.Errorf("scan failed: %w", err)
 	}
 
-	if osFound != nil && osFound.Eosl {
-		log.Logger.Warnf("This OS version is no longer supported by the distribution: %s %s", osFound.Family, osFound.Name)
-		log.Logger.Warnf("The vulnerability detection may be insufficient because security updates are not provided")
-	}
-
-	// Layer makes sense only when scanning container images
-	if artifactInfo.Type != ftypes.ArtifactContainerImage {
-		removeLayer(results)
+	ptros := &osFound
+	if osFound.Detected() && osFound.Eosl {
+		log.Warn("This OS version is no longer supported by the distribution",
+			log.String("family", string(osFound.Family)), log.String("version", osFound.Name))
+		log.Warn("The vulnerability detection may be insufficient because security updates are not provided")
+	} else if !osFound.Detected() {
+		ptros = nil
 	}
 
 	return types.Report{
 		SchemaVersion: report.SchemaVersion,
+		CreatedAt:     clock.Now(ctx),
 		ArtifactName:  artifactInfo.Name,
 		ArtifactType:  artifactInfo.Type,
 		Metadata: types.Metadata{
-			OS: osFound,
+			OS: ptros,
 
 			// Container image
 			ImageID:     artifactInfo.ImageMetadata.ID,
@@ -161,23 +193,7 @@ func (s Scanner) ScanArtifact(ctx context.Context, options types.ScanOptions) (t
 			RepoDigests: artifactInfo.ImageMetadata.RepoDigests,
 			ImageConfig: artifactInfo.ImageMetadata.ConfigFile,
 		},
-		CycloneDX: artifactInfo.CycloneDX,
-		Results:   results,
+		Results: results,
+		BOM:     artifactInfo.BOM,
 	}, nil
-}
-
-func removeLayer(results types.Results) {
-	for i := range results {
-		result := results[i]
-
-		for j := range result.Packages {
-			result.Packages[j].Layer = ftypes.Layer{}
-		}
-		for j := range result.Vulnerabilities {
-			result.Vulnerabilities[j].Layer = ftypes.Layer{}
-		}
-		for j := range result.Misconfigurations {
-			result.Misconfigurations[j].Layer = ftypes.Layer{}
-		}
-	}
 }

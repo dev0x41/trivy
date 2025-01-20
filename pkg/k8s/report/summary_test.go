@@ -6,52 +6,93 @@ import (
 
 	"github.com/stretchr/testify/assert"
 
-	"github.com/aquasecurity/trivy/pkg/commands/option"
+	"github.com/aquasecurity/trivy/pkg/types"
 )
 
 func TestReport_ColumnHeading(t *testing.T) {
+	allScanners := types.Scanners{
+		types.VulnerabilityScanner,
+		types.MisconfigScanner,
+		types.SecretScanner,
+		types.RBACScanner,
+	}
+
 	tests := []struct {
 		name             string
-		rp               option.ReportOption
+		scanners         types.Scanners
 		availableColumns []string
 		want             []string
 	}{
 		{
-			name:             "all workload columns",
-			rp:               option.ReportOption{SecurityChecks: []string{"vuln", "config", "secret", "rbac"}},
+			name:             "filter workload columns",
+			scanners:         allScanners,
 			availableColumns: WorkloadColumns(),
-			want:             []string{NamespaceColumn, ResourceColumn, VulnerabilitiesColumn, MisconfigurationsColumn, SecretsColumn},
+			want: []string{
+				NamespaceColumn,
+				ResourceColumn,
+				VulnerabilitiesColumn,
+				MisconfigurationsColumn,
+				SecretsColumn,
+			},
 		},
 		{
-			name:             "all rbac columns",
-			rp:               option.ReportOption{SecurityChecks: []string{"vuln", "config", "secret", "rbac"}},
+			name:             "filter rbac columns",
+			scanners:         allScanners,
 			availableColumns: RoleColumns(),
-			want:             []string{NamespaceColumn, ResourceColumn, RbacAssessmentColumn},
+			want: []string{
+				NamespaceColumn,
+				ResourceColumn,
+				RbacAssessmentColumn,
+			},
+		},
+		{
+			name:             "filter infra columns",
+			scanners:         allScanners,
+			availableColumns: InfraColumns(),
+			want: []string{
+				NamespaceColumn,
+				ResourceColumn,
+				VulnerabilitiesColumn,
+				MisconfigurationsColumn,
+				SecretsColumn,
+			},
 		},
 		{
 			name:             "config column only",
-			rp:               option.ReportOption{SecurityChecks: []string{"config"}},
+			scanners:         types.Scanners{types.MisconfigScanner},
 			availableColumns: WorkloadColumns(),
-			want:             []string{NamespaceColumn, ResourceColumn, MisconfigurationsColumn},
+			want: []string{
+				NamespaceColumn,
+				ResourceColumn,
+				MisconfigurationsColumn,
+			},
 		},
 		{
 			name:             "secret column only",
-			rp:               option.ReportOption{SecurityChecks: []string{"secret"}},
+			scanners:         types.Scanners{types.SecretScanner},
 			availableColumns: WorkloadColumns(),
-			want:             []string{NamespaceColumn, ResourceColumn, SecretsColumn},
+			want: []string{
+				NamespaceColumn,
+				ResourceColumn,
+				SecretsColumn,
+			},
 		},
 		{
 			name:             "vuln column only",
-			rp:               option.ReportOption{SecurityChecks: []string{"vuln"}},
+			scanners:         types.Scanners{types.VulnerabilityScanner},
 			availableColumns: WorkloadColumns(),
-			want:             []string{NamespaceColumn, ResourceColumn, VulnerabilitiesColumn},
+			want: []string{
+				NamespaceColumn,
+				ResourceColumn,
+				VulnerabilitiesColumn,
+			},
 		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			column := ColumnHeading(tt.rp.SecurityChecks, tt.availableColumns)
-			if !assert.Equal(t, column, tt.want) {
+			column := ColumnHeading(tt.scanners, tt.availableColumns)
+			if !assert.Equal(t, tt.want, column) {
 				t.Error(fmt.Errorf("TestReport_ColumnHeading want %v got %v", tt.want, column))
 			}
 		})

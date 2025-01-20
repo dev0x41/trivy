@@ -68,15 +68,20 @@ The following table lists the configurable parameters of the Trivy chart and the
 | `trivy.registryPassword`              | The password used to log in at dockerhub. More info: https://aquasecurity.github.io/trivy/dev/advanced/private-registries/docker-hub/ |      |
 | `trivy.registryCredentialsExistingSecret` | Name of Secret containing dockerhub credentials. Alternative to the 2 parameters above, has precedence if set.                    |      |
 | `trivy.serviceAccount.annotations`        | Additional annotations to add to the Kubernetes service account resource |     |
-| `trivy.skipUpdate`                    | The flag to enable or disable Trivy DB downloads from GitHub            | `false`        |
+| `trivy.skipDBUpdate`                    | The flag to enable or disable Trivy DB downloads from GitHub            | `false`        |
 | `trivy.dbRepository`                  | OCI repository to retrieve the trivy vulnerability database from        | `ghcr.io/aquasecurity/trivy-db`        |
 | `trivy.cache.redis.enabled`           | Enable Redis as caching backend                                         | `false` |
 | `trivy.cache.redis.url`               | Specify redis connection url, e.g. redis://redis.redis.svc:6379         | `` |
+| `trivy.cache.redis.ttl`               | Specify redis TTL, e.g. 3600s or 24h                                    | `` |
+| `trivy.cache.redis.tls`               | Enable Redis TLS with public certificates                               | `` |
 | `trivy.serverToken`                   | The token to authenticate Trivy client with Trivy server                | `` |
+| `trivy.existingSecret`                | existingSecret if an existing secret has been created outside the chart. Overrides gitHubToken, registryUsername, registryPassword, serverToken | `` |
 | `trivy.podAnnotations`                | Annotations for pods created by statefulset                             | `{}` |
+| `trivy.extraEnvVars`                  | extraEnvVars to be set on the container                                 | `{}` |
 | `service.name`                        | If specified, the name used for the Trivy service                       |     |
 | `service.type`                        | Kubernetes service type                                                 | `ClusterIP` |
 | `service.port`                        | Kubernetes service port                                                 | `4954`      |
+| `service.sessionAffinity`             | Kubernetes service session affinity                                     | `ClientIP`  |
 | `httpProxy`                           | The URL of the HTTP proxy server                                        |     |
 | `httpsProxy`                          | The URL of the HTTPS proxy server                                       |     |
 | `noProxy`                             | The URLs that the proxy settings do not apply to                        |     |
@@ -102,5 +107,5 @@ This chart uses a PersistentVolumeClaim to reduce the number of database downloa
 
 ## Caching
 
-You can specify a Redis server as cache backend. This Redis server has to be already present. You can use the [bitname chart](https://bitnami.com/stack/redis/helm).
+You can specify a Redis server as cache backend. This Redis server has to be already present. You can use the [bitnami chart](https://bitnami.com/stack/redis/helm).
 More Information about the caching backends can be found [here](https://github.com/aquasecurity/trivy#specify-cache-backend).

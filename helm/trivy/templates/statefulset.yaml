@@ -17,7 +17,9 @@ spec:
       app.kubernetes.io/instance: {{ .Release.Name }}
   {{- if .Values.persistence.enabled }}
   volumeClaimTemplates:
-    - metadata:
+    - apiVersion: v1	
+      kind: PersistentVolumeClaim
+      metadata:
         name: data
       spec:
         resources:
@@ -90,7 +92,11 @@ spec:
             - configMapRef:
                 name: {{ include "trivy.fullname" . }}
             - secretRef:
+                {{- if not .Values.trivy.existingSecret }}
                 name: {{ include "trivy.fullname" . }}
+                {{- else }}
+                name: {{ .Values.trivy.existingSecret }}
+                {{- end }}
           ports:
             - name: trivy-http
               containerPort: {{ .Values.service.port }}

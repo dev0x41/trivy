@@ -1,14 +1,15 @@
 package report
 
 import (
+	"context"
+	"fmt"
 	"io"
-	"sync"
-
-	dbTypes "github.com/aquasecurity/trivy-db/pkg/types"
+	"strings"
 
 	"golang.org/x/xerrors"
 
-	pkgReport "github.com/aquasecurity/trivy/pkg/report"
+	dbTypes "github.com/aquasecurity/trivy-db/pkg/types"
+	pkgReport "github.com/aquasecurity/trivy/pkg/report/table"
 )
 
 type TableWriter struct {
@@ -28,33 +29,42 @@ const (
 )
 
 func WorkloadColumns() []string {
-	return []string{VulnerabilitiesColumn, MisconfigurationsColumn, SecretsColumn}
+	return []string{
+		VulnerabilitiesColumn,
+		MisconfigurationsColumn,
+		SecretsColumn,
+	}
 }
+
 func RoleColumns() []string {
 	return []string{RbacAssessmentColumn}
 }
 
-func (tw TableWriter) Write(report Report) error {
+func InfraColumns() []string {
+	return []string{
+		VulnerabilitiesColumn,
+		MisconfigurationsColumn,
+		SecretsColumn,
+	}
+}
+
+func (tw TableWriter) Write(ctx context.Context, report Report) error {
 	switch tw.Report {
-	case allReport:
-		t := pkgReport.TableWriter{Output: tw.Output, Severities: tw.Severities, ShowMessageOnce: &sync.Once{}}
-		for _, r := range report.Vulnerabilities {
+	case AllReport:
+		t := pkgReport.Writer{
+			Output:     tw.Output,
+			Severities: tw.Severities,
+		}
+		for i, r := range report.Resources {
 			if r.Report.Results.Failed() {
-				err := t.Write(r.Report)
+				updateTargetContext(&report.Resources[i])
+				err := t.Write(ctx, r.Report)
 				if err != nil {
 					return err
 				}
 			}
 		}
-		for _, r := range report.Misconfigurations {
-			if r.Report.Results.Failed() {
-				err := t.Write(r.Report)
-				if err != nil {
-					return err
-				}
-			}
-		}
-	case summaryReport:
+	case SummaryReport:
 		writer := NewSummaryWriter(tw.Output, tw.Severities, tw.ColumnHeading)
 		return writer.Write(report)
 	default:
@@ -62,4 +72,15 @@ func (tw TableWriter) Write(report Report) error {
 	}
 
 	return nil
+}
+
+// updateTargetContext add context namespace, kind and name to the target
+func updateTargetContext(r *Resource) {
+	targetName := fmt.Sprintf("namespace: %s, %s: %s", r.Namespace, strings.ToLower(r.Kind), r.Name)
+	if r.Kind == "NodeComponents" || r.Kind == "NodeInfo" {
+		targetName = fmt.Sprintf("node: %s", r.Name)
+	}
+	for i := range r.Report.Results {
+		r.Report.Results[i].Target = targetName
+	}
 }
