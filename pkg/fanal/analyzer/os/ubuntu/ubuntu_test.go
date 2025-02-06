@@ -5,12 +5,11 @@ import (
 	"os"
 	"testing"
 
-	"github.com/aquasecurity/trivy/pkg/fanal/types"
-
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 
 	"github.com/aquasecurity/trivy/pkg/fanal/analyzer"
+	"github.com/aquasecurity/trivy/pkg/fanal/types"
 )
 
 func Test_ubuntuOSAnalyzer_Analyze(t *testing.T) {
@@ -24,7 +23,7 @@ func Test_ubuntuOSAnalyzer_Analyze(t *testing.T) {
 			name:      "happy path",
 			inputFile: "testdata/lsb-release",
 			want: &analyzer.AnalysisResult{
-				OS: &types.OS{Family: "ubuntu", Name: "18.04"},
+				OS: types.OS{Family: "ubuntu", Name: "18.04"},
 			},
 		},
 		{
@@ -46,8 +45,7 @@ func Test_ubuntuOSAnalyzer_Analyze(t *testing.T) {
 				Content:  f,
 			})
 			if tt.wantErr != "" {
-				require.NotNil(t, err)
-				assert.Contains(t, err.Error(), tt.wantErr)
+				require.ErrorContains(t, err, tt.wantErr)
 				return
 			} else {
 				require.NoError(t, err)

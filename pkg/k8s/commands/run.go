@@ -3,58 +3,66 @@ package commands
 import (
 	"context"
 	"errors"
+	"fmt"
 
-	"github.com/urfave/cli/v2"
+	"github.com/spf13/viper"
 	"golang.org/x/xerrors"
 
+	k8sArtifacts "github.com/aquasecurity/trivy-kubernetes/pkg/artifacts"
+	"github.com/aquasecurity/trivy-kubernetes/pkg/k8s"
 	cmd "github.com/aquasecurity/trivy/pkg/commands/artifact"
+	"github.com/aquasecurity/trivy/pkg/commands/operation"
+	cr "github.com/aquasecurity/trivy/pkg/compliance/report"
+	"github.com/aquasecurity/trivy/pkg/flag"
+	k8sRep "github.com/aquasecurity/trivy/pkg/k8s"
 	"github.com/aquasecurity/trivy/pkg/k8s/report"
 	"github.com/aquasecurity/trivy/pkg/k8s/scanner"
 	"github.com/aquasecurity/trivy/pkg/log"
-
-	"github.com/aquasecurity/trivy-kubernetes/pkg/artifacts"
-	"github.com/aquasecurity/trivy-kubernetes/pkg/k8s"
-)
-
-const (
-	clusterArtifact = "cluster"
-	allArtifact     = "all"
+	"github.com/aquasecurity/trivy/pkg/types"
+	"github.com/aquasecurity/trivy/pkg/version/doc"
 )
 
 // Run runs a k8s scan
-func Run(cliCtx *cli.Context) error {
-	opt, err := cmd.InitOption(cliCtx)
-	if err != nil {
-		return xerrors.Errorf("option error: %w", err)
+func Run(ctx context.Context, args []string, opts flag.Options) error {
+	clusterOptions := []k8s.ClusterOption{
+		k8s.WithKubeConfig(opts.K8sOptions.KubeConfig),
+		k8s.WithBurst(opts.K8sOptions.Burst),
+		k8s.WithQPS(opts.K8sOptions.QPS),
 	}
-
-	cluster, err := k8s.GetCluster(opt.KubernetesOption.ClusterContext)
+	if len(args) > 0 {
+		clusterOptions = append(clusterOptions, k8s.WithContext(args[0]))
+	}
+	cluster, err := k8s.GetCluster(clusterOptions...)
 	if err != nil {
 		return xerrors.Errorf("failed getting k8s cluster: %w", err)
 	}
+	ctx, cancel := context.WithTimeout(ctx, opts.Timeout)
 
-	switch cliCtx.Args().Get(0) {
-	case clusterArtifact:
-		return clusterRun(cliCtx, opt, cluster)
-	case allArtifact:
-		return namespaceRun(cliCtx, opt, cluster)
-	default: // resourceArtifact
-		return resourceRun(cliCtx, opt, cluster)
+	defer func() {
+		cancel()
+		if errors.Is(err, context.DeadlineExceeded) {
+			// e.g. https://aquasecurity.github.io/trivy/latest/docs/configuration
+			log.WarnContext(ctx, fmt.Sprintf("Provide a higher timeout value, see %s", doc.URL("/docs/configuration/", "")))
+		}
+	}()
+	opts.K8sVersion = cluster.GetClusterVersion()
+	return clusterRun(ctx, opts, cluster)
+}
+
+type runner struct {
+	flagOpts flag.Options
+	cluster  string
+}
+
+func newRunner(flagOpts flag.Options, cluster string) *runner {
+	return &runner{
+		flagOpts,
+		cluster,
 	}
 }
 
-func run(ctx context.Context, opt cmd.Option, cluster string, artifacts []*artifacts.Artifact) error {
-	ctx, cancel := context.WithTimeout(ctx, opt.Timeout)
-	defer cancel()
-
-	var err error
-	defer func() {
-		if xerrors.Is(err, context.DeadlineExceeded) {
-			log.Logger.Warn("Increase --timeout value")
-		}
-	}()
-
-	runner, err := cmd.NewRunner(opt)
+func (r *runner) run(ctx context.Context, artifacts []*k8sArtifacts.Artifact) error {
+	runner, err := cmd.NewRunner(ctx, r.flagOpts)
 	if err != nil {
 		if errors.Is(err, cmd.SkipScan) {
 			return nil
@@ -63,36 +71,70 @@ func run(ctx context.Context, opt cmd.Option, cluster string, artifacts []*artif
 	}
 	defer func() {
 		if err := runner.Close(ctx); err != nil {
-			log.Logger.Errorf("failed to close runner: %s", err)
+			log.ErrorContext(ctx, "failed to close runner: %s", err)
 		}
 	}()
 
-	s := scanner.NewScanner(cluster, runner, opt)
+	s := scanner.NewScanner(r.cluster, runner, r.flagOpts)
 
-	r, err := s.Scan(ctx, artifacts)
+	// set scanners types by spec
+	if r.flagOpts.Compliance.Spec.ID != "" {
+		scanners, err := r.flagOpts.Compliance.Scanners()
+		if err != nil {
+			return xerrors.Errorf("scanner error: %w", err)
+		}
+		r.flagOpts.ScanOptions.Scanners = scanners
+	}
+	var rpt report.Report
+	log.Info("Scanning K8s...", log.String("K8s", r.cluster))
+	rpt, err = s.Scan(ctx, artifacts)
 	if err != nil {
 		return xerrors.Errorf("k8s scan error: %w", err)
 	}
-	if err := report.Write(r, report.Option{
-		Format:     opt.Format,
-		Report:     opt.KubernetesOption.ReportFormat,
-		Output:     opt.Output,
-		Severities: opt.Severities,
-	}, opt.ReportOption.SecurityChecks); err != nil {
+
+	output, cleanup, err := r.flagOpts.OutputWriter(ctx)
+	if err != nil {
+		return xerrors.Errorf("failed to create output file: %w", err)
+	}
+	defer cleanup()
+
+	if r.flagOpts.Compliance.Spec.ID != "" {
+		var scanResults []types.Results
+		for _, rss := range rpt.Resources {
+			scanResults = append(scanResults, rss.Results)
+		}
+		complianceReport, err := cr.BuildComplianceReport(scanResults, r.flagOpts.Compliance)
+		if err != nil {
+			return xerrors.Errorf("compliance report build error: %w", err)
+		}
+		return cr.Write(ctx, complianceReport, cr.Option{
+			Format: r.flagOpts.Format,
+			Report: r.flagOpts.ReportFormat,
+			Output: output,
+		})
+	}
+
+	if err := k8sRep.Write(ctx, rpt, report.Option{
+		Format:     r.flagOpts.Format,
+		Report:     r.flagOpts.ReportFormat,
+		Output:     output,
+		Severities: r.flagOpts.Severities,
+		Scanners:   r.flagOpts.ScanOptions.Scanners,
+		APIVersion: r.flagOpts.AppVersion,
+	}); err != nil {
 		return xerrors.Errorf("unable to write results: %w", err)
 	}
 
-	cmd.Exit(opt, r.Failed())
-
-	return nil
+	return operation.Exit(r.flagOpts, rpt.Failed(), types.Metadata{})
 }
 
 // Full-cluster scanning with '--format table' without explicit '--report all' is not allowed so that it won't mess up user's terminal.
 // To show all the results, user needs to specify "--report all" explicitly
 // even though the default value of "--report" is "all".
 //
-// e.g. $ trivy k8s --report all cluster
-//      $ trivy k8s --report all all
+// e.g.
+// $ trivy k8s --report all cluster
+// $ trivy k8s --report all all
 //
 // Or they can use "--format json" with implicit "--report all".
 //
@@ -101,10 +143,10 @@ func run(ctx context.Context, opt cmd.Option, cluster string, artifacts []*artif
 // Single resource scanning is allowed with implicit "--report all".
 //
 // e.g. $ trivy k8s pod myapp
-func validateReportArguments(cliCtx *cli.Context) error {
-	if cliCtx.String("report") == "all" &&
-		!cliCtx.IsSet("report") &&
-		cliCtx.String("format") == "table" {
+func validateReportArguments(opts flag.Options) error {
+	if opts.ReportFormat == "all" &&
+		!viper.IsSet("report") &&
+		opts.Format == "table" {
 
 		m := "All the results in the table format can mess up your terminal. Use \"--report all\" to tell Trivy to output it to your terminal anyway, or consider \"--report summary\" to show the summary output."
 

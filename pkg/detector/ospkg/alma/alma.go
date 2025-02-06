@@ -1,14 +1,15 @@
 package alma
 
 import (
+	"context"
 	"strings"
 	"time"
 
 	version "github.com/knqyf263/go-rpm-version"
 	"golang.org/x/xerrors"
-	"k8s.io/utils/clock"
 
 	"github.com/aquasecurity/trivy-db/pkg/vulnsrc/alma"
+	osver "github.com/aquasecurity/trivy/pkg/detector/ospkg/version"
 	ftypes "github.com/aquasecurity/trivy/pkg/fanal/types"
 	"github.com/aquasecurity/trivy/pkg/log"
 	"github.com/aquasecurity/trivy/pkg/scanner/utils"
@@ -18,52 +19,29 @@ import (
 var (
 	eolDates = map[string]time.Time{
 		// Source:
-		// https://wiki.almalinux.org/FAQ.html#how-long-will-cloudlinux-support-almalinux
-		"8": time.Date(2029, 12, 31, 23, 59, 59, 0, time.UTC),
+		// https://endoflife.date/almalinux
+		"8": time.Date(2029, 3, 1, 23, 59, 59, 0, time.UTC),
+		"9": time.Date(2032, 5, 31, 23, 59, 59, 0, time.UTC),
 	}
 )
 
-type options struct {
-	clock clock.Clock
-}
-
-type option func(*options)
-
-func WithClock(clock clock.Clock) option {
-	return func(opts *options) {
-		opts.clock = clock
-	}
-}
-
 // Scanner implements the AlmaLinux scanner
 type Scanner struct {
-	vs alma.VulnSrc
-	*options
+	vs *alma.VulnSrc
 }
 
 // NewScanner is the factory method for Scanner
-func NewScanner(opts ...option) *Scanner {
-	o := &options{
-		clock: clock.RealClock{},
-	}
-
-	for _, opt := range opts {
-		opt(o)
-	}
+func NewScanner() *Scanner {
 	return &Scanner{
-		vs:      alma.NewVulnSrc(),
-		options: o,
+		vs: alma.NewVulnSrc(),
 	}
 }
 
 // Detect vulnerabilities in package using AlmaLinux scanner
-func (s *Scanner) Detect(osVer string, _ *ftypes.Repository, pkgs []ftypes.Package) ([]types.DetectedVulnerability, error) {
-	log.Logger.Info("Detecting AlmaLinux vulnerabilities...")
-	if strings.Count(osVer, ".") > 0 {
-		osVer = osVer[:strings.Index(osVer, ".")]
-	}
-	log.Logger.Debugf("AlmaLinux: os version: %s", osVer)
-	log.Logger.Debugf("AlmaLinux: the number of packages: %d", len(pkgs))
+func (s *Scanner) Detect(ctx context.Context, osVer string, _ *ftypes.Repository, pkgs []ftypes.Package) ([]types.DetectedVulnerability, error) {
+	osVer = osver.Major(osVer)
+	log.InfoContext(ctx, "Detecting vulnerabilities...", log.String("os_version", osVer),
+		log.Int("pkg_num", len(pkgs)))
 
 	var vulns []types.DetectedVulnerability
 	var skipPkgs []string
@@ -80,43 +58,35 @@ func (s *Scanner) Detect(osVer string, _ *ftypes.Repository, pkgs []ftypes.Packa
 
 		installed := utils.FormatVersion(pkg)
 		installedVersion := version.NewVersion(installed)
-
 		for _, adv := range advisories {
 			fixedVersion := version.NewVersion(adv.FixedVersion)
 			if installedVersion.LessThan(fixedVersion) {
 				vuln := types.DetectedVulnerability{
 					VulnerabilityID:  adv.VulnerabilityID,
+					PkgID:            pkg.ID,
 					PkgName:          pkg.Name,
 					InstalledVersion: installed,
 					FixedVersion:     fixedVersion.String(),
-					Ref:              pkg.Ref,
+					PkgIdentifier:    pkg.Identifier,
 					Layer:            pkg.Layer,
 					DataSource:       adv.DataSource,
+					Custom:           adv.Custom,
 				}
 				vulns = append(vulns, vuln)
 			}
 		}
 	}
 	if len(skipPkgs) > 0 {
-		log.Logger.Infof("Skipped detection of these packages: %q because modular packages cannot be detected correctly due to a bug in AlmaLinux. See also: https://bugs.almalinux.org/view.php?id=173", skipPkgs)
+		log.InfoContext(ctx, "Skipped detection of the packages because modular packages cannot be detected correctly due to a bug in AlmaLinux. See also: https://bugs.almalinux.org/view.php?id=173",
+			log.Any("packages", skipPkgs))
 	}
 
 	return vulns, nil
 }
 
-// IsSupportedVersion checks the OSFamily can be scanned using AlmaLinux scanner
-func (s *Scanner) IsSupportedVersion(osFamily, osVer string) bool {
-	if strings.Count(osVer, ".") > 0 {
-		osVer = osVer[:strings.Index(osVer, ".")]
-	}
-
-	eol, ok := eolDates[osVer]
-	if !ok {
-		log.Logger.Warnf("This OS version is not on the EOL list: %s %s", osFamily, osVer)
-		return false
-	}
-
-	return s.clock.Now().Before(eol)
+// IsSupportedVersion checks if the version is supported.
+func (s *Scanner) IsSupportedVersion(ctx context.Context, osFamily ftypes.OSType, osVer string) bool {
+	return osver.Supported(ctx, eolDates, osFamily, osver.Major(osVer))
 }
 
 func addModularNamespace(name, label string) string {

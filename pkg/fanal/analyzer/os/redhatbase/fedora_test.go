@@ -23,7 +23,7 @@ func Test_fedoraOSAnalyzer_Analyze(t *testing.T) {
 			name:      "happy path",
 			inputFile: "testdata/fedora_29/fedora-release",
 			want: &analyzer.AnalysisResult{
-				OS: &types.OS{Family: "fedora", Name: "29"},
+				OS: types.OS{Family: "fedora", Name: "29"},
 			},
 		},
 		{
@@ -45,8 +45,7 @@ func Test_fedoraOSAnalyzer_Analyze(t *testing.T) {
 				Content:  f,
 			})
 			if tt.wantErr != "" {
-				require.NotNil(t, err)
-				assert.Contains(t, err.Error(), tt.wantErr)
+				require.ErrorContains(t, err, tt.wantErr)
 				return
 			} else {
 				require.NoError(t, err)

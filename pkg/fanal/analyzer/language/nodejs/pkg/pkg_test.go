@@ -14,10 +14,11 @@ import (
 
 func Test_nodePkgLibraryAnalyzer_Analyze(t *testing.T) {
 	tests := []struct {
-		name      string
-		inputFile string
-		want      *analyzer.AnalysisResult
-		wantErr   string
+		name            string
+		inputFile       string
+		includeChecksum bool
+		want            *analyzer.AnalysisResult
+		wantErr         string
 	}{
 		{
 			name:      "happy path",
@@ -27,8 +28,9 @@ func Test_nodePkgLibraryAnalyzer_Analyze(t *testing.T) {
 					{
 						Type:     types.NodePkg,
 						FilePath: "testdata/package.json",
-						Libraries: []types.Package{
+						Packages: types.Packages{
 							{
+								ID:       "lodash@5.0.0",
 								Name:     "lodash",
 								Version:  "5.0.0",
 								Licenses: []string{"MIT"},
@@ -40,9 +42,36 @@ func Test_nodePkgLibraryAnalyzer_Analyze(t *testing.T) {
 			},
 		},
 		{
-			name:      "sad path",
+			name:            "happy path with checksum",
+			inputFile:       "testdata/package.json",
+			includeChecksum: true,
+			want: &analyzer.AnalysisResult{
+				Applications: []types.Application{
+					{
+						Type:     types.NodePkg,
+						FilePath: "testdata/package.json",
+						Packages: types.Packages{
+							{
+								ID:       "lodash@5.0.0",
+								Name:     "lodash",
+								Version:  "5.0.0",
+								Licenses: []string{"MIT"},
+								FilePath: "testdata/package.json",
+								Digest:   "sha1:901a7b55410321c4d35543506cff2a8613ef5aa2",
+							},
+						},
+					},
+				},
+			},
+		},
+		{
+			name:      "happy path without name",
 			inputFile: "testdata/noname.json",
-			wantErr:   "unable to parse testdata/noname.json",
+		},
+		{
+			name:      "sad path",
+			inputFile: "testdata/sad.json",
+			wantErr:   "JSON decode error",
 		},
 	}
 	for _, tt := range tests {
@@ -56,15 +85,15 @@ func Test_nodePkgLibraryAnalyzer_Analyze(t *testing.T) {
 			got, err := a.Analyze(ctx, analyzer.AnalysisInput{
 				FilePath: tt.inputFile,
 				Content:  f,
+				Options:  analyzer.AnalysisOptions{FileChecksum: tt.includeChecksum},
 			})
 
 			if tt.wantErr != "" {
-				require.NotNil(t, err)
-				assert.Contains(t, err.Error(), tt.wantErr)
+				require.ErrorContains(t, err, tt.wantErr)
 				return
 			}
 
-			assert.NoError(t, err)
+			require.NoError(t, err)
 			assert.Equal(t, tt.want, got)
 		})
 	}

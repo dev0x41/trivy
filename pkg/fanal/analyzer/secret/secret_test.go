@@ -1,4 +1,4 @@
-package secret
+package secret_test
 
 import (
 	"context"
@@ -9,6 +9,7 @@ import (
 	"github.com/stretchr/testify/require"
 
 	"github.com/aquasecurity/trivy/pkg/fanal/analyzer"
+	"github.com/aquasecurity/trivy/pkg/fanal/analyzer/secret"
 	"github.com/aquasecurity/trivy/pkg/fanal/types"
 )
 
@@ -94,6 +95,16 @@ func TestSecretAnalyzer(t *testing.T) {
 			},
 		},
 	}
+	wantFindingGH_PAT := types.SecretFinding{
+		RuleID:    "github-fine-grained-pat",
+		Category:  "GitHub",
+		Title:     "GitHub Fine-grained personal access tokens",
+		Severity:  "CRITICAL",
+		StartLine: 1,
+		EndLine:   1,
+		Match:     "Binary file \"/testdata/secret.cpython-310.pyc\" matches a rule \"GitHub Fine-grained personal access tokens\"",
+	}
+
 	tests := []struct {
 		name       string
 		configPath string
@@ -110,7 +121,10 @@ func TestSecretAnalyzer(t *testing.T) {
 				Secrets: []types.Secret{
 					{
 						FilePath: "testdata/secret.txt",
-						Findings: []types.SecretFinding{wantFinding1, wantFinding2},
+						Findings: []types.SecretFinding{
+							wantFinding1,
+							wantFinding2,
+						},
 					},
 				},
 			},
@@ -123,7 +137,10 @@ func TestSecretAnalyzer(t *testing.T) {
 				Secrets: []types.Secret{
 					{
 						FilePath: "/testdata/secret.txt",
-						Findings: []types.SecretFinding{wantFinding1, wantFinding2},
+						Findings: []types.SecretFinding{
+							wantFinding1,
+							wantFinding2,
+						},
 					},
 				},
 			},
@@ -146,18 +163,36 @@ func TestSecretAnalyzer(t *testing.T) {
 			filePath:   "testdata/binaryfile",
 			want:       nil,
 		},
+		{
+			name:       "python binary file",
+			configPath: "testdata/skip-tests-config.yaml",
+			filePath:   "testdata/secret.cpython-310.pyc",
+			want: &analyzer.AnalysisResult{
+				Secrets: []types.Secret{
+					{
+						FilePath: "/testdata/secret.cpython-310.pyc",
+						Findings: []types.SecretFinding{
+							wantFindingGH_PAT,
+						},
+					},
+				},
+			},
+		},
 	}
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			a, err := newSecretAnalyzer(tt.configPath)
+			a := secret.SecretAnalyzer{}
+			err := a.Init(analyzer.AnalyzerOptions{
+				SecretScannerOption: analyzer.SecretScannerOption{ConfigPath: tt.configPath},
+			})
 			require.NoError(t, err)
 			content, err := os.Open(tt.filePath)
 			require.NoError(t, err)
 			fi, err := content.Stat()
 			require.NoError(t, err)
 
-			got, err := a.Analyze(context.TODO(), analyzer.AnalysisInput{
+			got, err := a.Analyze(context.Background(), analyzer.AnalysisInput{
 				FilePath: tt.filePath,
 				Dir:      tt.dir,
 				Content:  content,
@@ -205,7 +240,12 @@ func TestSecretRequire(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			a, err := newSecretAnalyzer("")
+			a := secret.SecretAnalyzer{}
+			err := a.Init(analyzer.AnalyzerOptions{
+				SecretScannerOption: analyzer.SecretScannerOption{
+					ConfigPath: "testdata/skip-tests-config.yaml",
+				},
+			})
 			require.NoError(t, err)
 
 			fi, err := os.Stat(tt.filePath)

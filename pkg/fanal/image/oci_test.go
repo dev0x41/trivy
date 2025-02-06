@@ -1,9 +1,10 @@
 package image
 
 import (
+	"path/filepath"
 	"testing"
 
-	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 )
 
 func TestTryOCI(t *testing.T) {
@@ -14,33 +15,45 @@ func TestTryOCI(t *testing.T) {
 	}{
 		{
 			name:         "correct path to index without tag",
-			ociImagePath: "testdata/multi",
+			ociImagePath: filepath.Join("testdata", "multi"),
 			wantErr:      "",
 		},
 		{
 			name:         "correct path to index with correct tag",
-			ociImagePath: "testdata/multi:tg11",
+			ociImagePath: filepath.Join("testdata", "multi:tg11"),
 			wantErr:      "",
 		},
 		{
 			name:         "correct path to index with incorrect tag",
-			ociImagePath: "testdata/multi:tg12",
-			wantErr:      "invalid OCI image tag",
+			ociImagePath: filepath.Join("testdata", "multi:tg12"),
+			wantErr:      "invalid OCI image ref",
 		},
 		{
 			name:         "correct path to manifest without tag",
-			ociImagePath: "testdata/single",
+			ociImagePath: filepath.Join("testdata", "single"),
 			wantErr:      "",
 		},
 		{
 			name:         "correct path to manifest with correct tag",
-			ociImagePath: "testdata/single:3.14",
+			ociImagePath: filepath.Join("testdata", "single:3.14"),
 			wantErr:      "",
 		},
 		{
 			name:         "correct path to manifest with incorrect tag",
-			ociImagePath: "testdata/single:3.11",
-			wantErr:      "invalid OCI image tag",
+			ociImagePath: filepath.Join("testdata", "single:3.11"),
+			wantErr:      "invalid OCI image ref",
+		},
+		{
+			name: "correct path to manifest with correct digest",
+			ociImagePath: filepath.Join("testdata",
+				"single@sha256:56ae38f2f5c54b98311b8b2463d4861368c451ac17098f4227d84946b42ab96d"),
+			wantErr: "",
+		},
+		{
+			name: "correct path to manifest with incorrect digest",
+			ociImagePath: filepath.Join("testdata",
+				"single@sha256:1111111111111111111111111111111111111111111111111111111111111111"),
+			wantErr: "invalid OCI image ref",
 		},
 	}
 
@@ -48,10 +61,9 @@ func TestTryOCI(t *testing.T) {
 		t.Run(test.name, func(t *testing.T) {
 			_, err := tryOCI(test.ociImagePath)
 			if test.wantErr != "" {
-				assert.NotNil(t, err)
-				assert.Contains(t, err.Error(), test.wantErr, err)
+				require.ErrorContains(t, err, test.wantErr, err)
 			} else {
-				assert.NoError(t, err)
+				require.NoError(t, err)
 			}
 		})
 	}

@@ -23,7 +23,7 @@ func Test_redhatOSAnalyzer_Analyze(t *testing.T) {
 			name:      "happy path",
 			inputFile: "testdata/redhat_6/redhat-release",
 			want: &analyzer.AnalysisResult{
-				OS: &types.OS{Family: "redhat", Name: "6.2"},
+				OS: types.OS{Family: "redhat", Name: "6.2"},
 			},
 		},
 		{
@@ -45,8 +45,7 @@ func Test_redhatOSAnalyzer_Analyze(t *testing.T) {
 				Content:  f,
 			})
 			if tt.wantErr != "" {
-				require.NotNil(t, err)
-				assert.Contains(t, err.Error(), tt.wantErr)
+				require.ErrorContains(t, err, tt.wantErr)
 				return
 			} else {
 				require.NoError(t, err)

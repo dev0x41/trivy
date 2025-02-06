@@ -3,17 +3,12 @@
 package integration
 
 import (
-	"io"
-	"os"
+	"github.com/aquasecurity/trivy/pkg/types"
 	"path/filepath"
 	"testing"
 
-	"github.com/stretchr/testify/assert"
-	"github.com/stretchr/testify/require"
-
-	"github.com/aquasecurity/trivy/pkg/commands"
-	"github.com/aquasecurity/trivy/pkg/module"
-	"github.com/aquasecurity/trivy/pkg/utils"
+	"github.com/aquasecurity/trivy/pkg/fanal/analyzer"
+	"github.com/aquasecurity/trivy/pkg/scanner/post"
 )
 
 func TestModule(t *testing.T) {
@@ -37,39 +32,31 @@ func TestModule(t *testing.T) {
 	// Set up testing DB
 	cacheDir := initDB(t)
 
-	// Set up module dir
-	moduleDir := filepath.Join(cacheDir, module.RelativeDir)
-	err := os.MkdirAll(moduleDir, 0700)
-	require.NoError(t, err)
-
-	// Set up Spring4Shell module
-	t.Setenv("XDG_DATA_HOME", cacheDir)
-	_, err = utils.CopyFile(filepath.Join("../", "examples", "module", "spring4shell", "spring4shell.wasm"),
-		filepath.Join(moduleDir, "spring4shell.wasm"))
-	require.NoError(t, err)
-
-	// Setup CLI App
-	app := commands.NewApp("dev")
-	app.Writer = io.Discard
-
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			osArgs := []string{"trivy", "--cache-dir", cacheDir, "image", "--ignore-unfixed", "--format", "json",
-				"--skip-update", "--offline-scan", "--input", tt.input}
-
-			// Set up the output file
-			outputFile := filepath.Join(t.TempDir(), "output.json")
-			if *update {
-				outputFile = tt.golden
+			osArgs := []string{
+				"--cache-dir",
+				cacheDir,
+				"image",
+				"--ignore-unfixed",
+				"--format",
+				"json",
+				"--skip-db-update",
+				"--offline-scan",
+				"--quiet",
+				"--module-dir",
+				filepath.Join("../", "examples", "module", "spring4shell"),
+				"--input",
+				tt.input,
 			}
 
-			osArgs = append(osArgs, []string{"--output", outputFile}...)
+			t.Cleanup(func() {
+				analyzer.DeregisterAnalyzer("spring4shell")
+				post.DeregisterPostScanner("spring4shell")
+			})
 
 			// Run Trivy
-			assert.Nil(t, app.Run(osArgs))
-
-			// Compare want and got
-			compareReports(t, tt.golden, outputFile)
+			runTest(t, osArgs, tt.golden, "", types.FormatJSON, runOptions{})
 		})
 	}
 }

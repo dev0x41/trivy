@@ -1,70 +1,36 @@
 package yaml
 
 import (
-	"context"
-	"io"
 	"os"
 	"path/filepath"
-	"regexp"
-
-	"golang.org/x/xerrors"
 
 	"github.com/aquasecurity/trivy/pkg/fanal/analyzer"
-	"github.com/aquasecurity/trivy/pkg/fanal/types"
+	"github.com/aquasecurity/trivy/pkg/fanal/analyzer/config"
+	"github.com/aquasecurity/trivy/pkg/iac/detection"
 )
 
-const version = 1
+const (
+	analyzerType = analyzer.TypeYAML
+	version      = 1
+)
 
-var requiredExts = []string{".yaml", ".yml"}
-
-type ConfigAnalyzer struct {
-	filePattern *regexp.Regexp
+func init() {
+	analyzer.RegisterPostAnalyzer(analyzerType, newYAMLConfigAnalyzer)
 }
 
-func NewConfigAnalyzer(filePattern *regexp.Regexp) ConfigAnalyzer {
-	return ConfigAnalyzer{
-		filePattern: filePattern,
-	}
+// yamlConfigAnalyzer analyzes YAML files
+type yamlConfigAnalyzer struct {
+	*config.Analyzer
 }
 
-func (a ConfigAnalyzer) Analyze(_ context.Context, input analyzer.AnalysisInput) (*analyzer.AnalysisResult, error) {
-	b, err := io.ReadAll(input.Content)
+func newYAMLConfigAnalyzer(opts analyzer.AnalyzerOptions) (analyzer.PostAnalyzer, error) {
+	a, err := config.NewAnalyzer(analyzerType, version, detection.FileTypeYAML, opts)
 	if err != nil {
-		return nil, xerrors.Errorf("failed to read %s: %w", input.FilePath, err)
+		return nil, err
 	}
-
-	return &analyzer.AnalysisResult{
-		Files: map[types.HandlerType][]types.File{
-			// it will be passed to misconfig post handler
-			types.MisconfPostHandler: {
-				{
-					Type:    types.YAML,
-					Path:    input.FilePath,
-					Content: b,
-				},
-			},
-		},
-	}, nil
+	return &yamlConfigAnalyzer{Analyzer: a}, nil
 }
 
-func (a ConfigAnalyzer) Required(filePath string, _ os.FileInfo) bool {
-	if a.filePattern != nil && a.filePattern.MatchString(filePath) {
-		return true
-	}
-
-	ext := filepath.Ext(filePath)
-	for _, required := range requiredExts {
-		if ext == required {
-			return true
-		}
-	}
-	return false
-}
-
-func (ConfigAnalyzer) Type() analyzer.Type {
-	return analyzer.TypeYaml
-}
-
-func (ConfigAnalyzer) Version() int {
-	return version
+func (*yamlConfigAnalyzer) Required(filePath string, _ os.FileInfo) bool {
+	return filepath.Ext(filePath) == ".yaml" || filepath.Ext(filePath) == ".yml"
 }

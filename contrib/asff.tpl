@@ -33,7 +33,7 @@
             "Severity": {
                 "Label": "{{ $severity }}"
             },
-            "Title": "Trivy found a vulnerability to {{ .VulnerabilityID }} in container {{ $target }}",
+            "Title": "Trivy found a vulnerability to {{ .VulnerabilityID }} in container {{ $target }}, related to {{ .PkgName }}",
             "Description": {{ escapeString $description | printf "%q" }},
             {{ if not (empty .PrimaryURL) -}}
             "Remediation": {
@@ -91,7 +91,7 @@
             "Severity": {
                 "Label": "{{ $severity }}"
             },
-            "Title": "Trivy found a misconfiguration in {{ $target }}: {{ .Title }}",
+            "Title": "Trivy found a misconfiguration in {{ $target }}: {{ escapeString .Title }}",
             "Description": {{ escapeString $description | printf "%q" }},
             "Remediation": {
                 "Recommendation": {
@@ -108,10 +108,47 @@
                     "Region": "{{ env "AWS_REGION" }}",
                     "Details": {
                         "Other": {
-                            "Message": "{{ .Message }}",
+                            "Message": "{{ escapeString .Message }}",
                             "Filename": "{{ $target }}",
                             "StartLine": "{{ .CauseMetadata.StartLine }}",
                             "EndLine": "{{ .CauseMetadata.EndLine }}"
+                        }
+                    }
+                }
+            ],
+            "RecordState": "ACTIVE"
+        }
+        {{- end -}}
+        {{- range .Secrets -}}
+            {{- if $t_first -}}{{- $t_first = false -}}{{- else -}},{{- end -}}
+            {{- $severity := .Severity -}}
+            {{- if eq $severity "UNKNOWN" -}}
+                {{- $severity = "INFORMATIONAL" -}}
+            {{- end -}}
+        {
+            "SchemaVersion": "2018-10-08",
+            "Id": "{{ $target }}",
+            "ProductArn": "arn:aws:securityhub:{{ env "AWS_REGION" }}::product/aquasecurity/aquasecurity",
+            "GeneratorId": "Trivy",
+            "AwsAccountId": "{{ env "AWS_ACCOUNT_ID" }}",
+            "Types": [ "Sensitive Data Identifications" ],
+            "CreatedAt": "{{ now | date "2006-01-02T15:04:05.999999999Z07:00" }}",
+            "UpdatedAt": "{{ now | date "2006-01-02T15:04:05.999999999Z07:00" }}",
+            "Severity": {
+                "Label": "{{ $severity }}"
+            },
+            "Title": "Trivy found a secret in {{ $target }}: {{ .Title }}",
+            "Description": "Trivy found a secret in {{ $target }}: {{ .Title }}",
+            "ProductFields": { "Product Name": "Trivy" },
+            "Resources": [
+                {
+                    "Type": "Other",
+                    "Id": "{{ $target }}",
+                    "Partition": "aws",
+                    "Region": "{{ env "AWS_REGION" }}",
+                    "Details": {
+                        "Other": {
+                            "Filename": "{{ $target }}"
                         }
                     }
                 }

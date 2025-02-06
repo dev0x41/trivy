@@ -1,18 +1,59 @@
-# Installation
+# Installing Trivy
 
-## RHEL/CentOS
+In this section you will find an aggregation of the different ways to install Trivy. Installation options are labeled as either "Official" or "Community". Official installations are developed by the Trivy team and supported by it. Community installations could be developed by anyone from the Trivy community, and collected here for your convenience. For support or questions about community installations, please contact the original developers.
+
+!!! note
+    If you are looking to integrate Trivy into another system, such as CI/CD, IDE, Kubernetes, etc, please see [Ecosystem section](../ecosystem/index.md) to explore integrations of Trivy with other tools.
+
+## Container image (Official)
+
+Use one of the official Trivy images:
+
+| Registry | Repository | Link |
+| --- | --- | --- |
+| Docker Hub | `docker.io/aquasec/trivy` | https://hub.docker.com/r/aquasec/trivy |
+| GitHub Container Registry (GHCR) | `ghcr.io/aquasecurity/trivy` | https://github.com/orgs/aquasecurity/packages/container/package/trivy |
+| AWS Elastic Container Registry (ECR) | `public.ecr.aws/aquasecurity/trivy` | https://gallery.ecr.aws/aquasecurity/trivy |
+
+!!! Tip
+    It is advisable to mount a persistent [cache dir](../docs/configuration/cache.md) on the host into the Trivy container.
+
+!!! Tip
+    For scanning container images with Trivy, mount the container engine socket from the host into the Trivy container.
+
+Example:
+
+``` bash
+docker run -v /var/run/docker.sock:/var/run/docker.sock -v $HOME/Library/Caches:/root/.cache/ aquasec/trivy:{{ git.tag[1:] }} image python:3.4-alpine
+```
+
+## GitHub Release (Official)
+
+1. Download the file for your operating system/architecture from [GitHub Release assets](https://github.com/aquasecurity/trivy/releases/tag/{{ git.tag }}).  
+2. Unpack the downloaded archive (`tar -xzf ./trivy.tar.gz`).
+3. Make sure the binary has execution bit turned on (`chmod +x ./trivy`).
+
+## Install Script (Official)
+
+For convenience, you can use the install script to download and install Trivy from GitHub Release.
+
+```bash
+curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sudo sh -s -- -b /usr/local/bin {{ git.tag }}
+```
+
+## RHEL/CentOS (Official)
 
 === "Repository"
     Add repository setting to `/etc/yum.repos.d`.
 
     ``` bash
-    RELEASE_VERSION=$(grep -Po '(?<=VERSION_ID=")[0-9]' /etc/os-release)
     cat << EOF | sudo tee -a /etc/yum.repos.d/trivy.repo
     [trivy]
     name=Trivy repository
-    baseurl=https://aquasecurity.github.io/trivy-repo/rpm/releases/$RELEASE_VERSION/\$basearch/
-    gpgcheck=0
+    baseurl=https://aquasecurity.github.io/trivy-repo/rpm/releases/\$basearch/
+    gpgcheck=1
     enabled=1
+    gpgkey=https://aquasecurity.github.io/trivy-repo/rpm/public.key
     EOF
     sudo yum -y update
     sudo yum -y install trivy
@@ -24,15 +65,15 @@
     rpm -ivh https://github.com/aquasecurity/trivy/releases/download/{{ git.tag }}/trivy_{{ git.tag[1:] }}_Linux-64bit.rpm
     ```
 
-## Debian/Ubuntu
+## Debian/Ubuntu (Official)
 
 === "Repository"
     Add repository setting to `/etc/apt/sources.list.d`.
 
     ``` bash
-    sudo apt-get install wget apt-transport-https gnupg lsb-release
-    wget -qO - https://aquasecurity.github.io/trivy-repo/deb/public.key | sudo apt-key add -
-    echo deb https://aquasecurity.github.io/trivy-repo/deb $(lsb_release -sc) main | sudo tee -a /etc/apt/sources.list.d/trivy.list
+    sudo apt-get install wget gnupg
+    wget -qO - https://aquasecurity.github.io/trivy-repo/deb/public.key | gpg --dearmor | sudo tee /usr/share/keyrings/trivy.gpg > /dev/null
+    echo "deb [signed-by=/usr/share/keyrings/trivy.gpg] https://aquasecurity.github.io/trivy-repo/deb generic main" | sudo tee -a /etc/apt/sources.list.d/trivy.list
     sudo apt-get update
     sudo apt-get install trivy
     ```
@@ -44,210 +85,118 @@
     sudo dpkg -i trivy_{{ git.tag[1:] }}_Linux-64bit.deb
     ```
 
-## Arch Linux
+## Homebrew (Official)
 
-Package trivy-bin can be installed from the Arch User Repository.
+Homebrew for macOS and Linux.
 
-=== "pikaur"
+```bash
+brew install trivy
+```
 
-    ``` bash
-    pikaur -Sy trivy-bin
+## Windows (Official)
+
+1. Download trivy_x.xx.x_windows-64bit.zip file from [releases page](https://github.com/aquasecurity/trivy/releases/).
+2. Unzip file and copy to any folder.
+
+## Arch Linux (Community)
+
+Arch Linux Package Repository.
+
+```bash
+sudo pacman -S trivy
+```
+
+References: 
+- <https://archlinux.org/packages/extra/x86_64/trivy/>
+- <https://gitlab.archlinux.org/archlinux/packaging/packages/trivy/-/blob/main/PKGBUILD>
+
+
+## MacPorts (Community)
+
+[MacPorts](https://www.macports.org) for macOS.
+
+```bash
+sudo port install trivy
+```
+
+References:
+- <https://ports.macports.org/port/trivy/details/>
+
+## Nix/NixOS (Community)
+
+Nix package manager for Linux and macOS.
+
+=== "Command line"
+    `nix-env --install -A nixpkgs.trivy`
+
+=== "Configuration"
+    ```nix
+    # your other config ...
+    environment.systemPackages = with pkgs; [
+      # your other packages ...
+      trivy
+    ];
     ```
 
-=== "yay"
-
-    ``` bash
-    yay -Sy trivy-bin
+=== "Home Manager"
+    ```nix
+    # your other config ...
+    home.packages = with pkgs; [
+      # your other packages ...
+      trivy
+    ];
     ```
 
-## Homebrew
+References: 
 
-You can use homebrew on macOS and Linux.
+-  https://github.com/NixOS/nixpkgs/blob/master/pkgs/tools/admin/trivy/default.nix
 
-```bash
-brew install aquasecurity/trivy/trivy
-```
+## FreeBSD (Official)
 
-## Nix/NixOS
-
-Direct issues installing `trivy` via `nix` through the channels mentioned [here](https://nixos.wiki/wiki/Support)
-
-You can use `nix` on Linux or macOS and on other platforms unofficially.
-
-`nix-env --install -A nixpkgs.trivy`
-
-Or through your configuration as usual
-
-NixOS:
-
-```nix
-  # your other config ...
-  environment.systemPackages = with pkgs; [
-    # your other packages ...
-    trivy
-  ];
-```
-
-home-manager:
-
-```nix
-  # your other config ...
-  home.packages = with pkgs; [
-    # your other packages ...
-    trivy
-  ];
-```
-
-## Install Script
-
-This script downloads Trivy binary based on your OS and architecture.
+Pkg package manager for FreeBSD.
 
 ```bash
-curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sh -s -- -b /usr/local/bin {{ git.tag }}
+pkg install trivy
 ```
 
-## Binary
+## asdf/mise (Community)
 
-Download the archive file for your operating system/architecture from [here](https://github.com/aquasecurity/trivy/releases/tag/{{ git.tag }}). 
-Unpack the archive, and put the binary somewhere in your `$PATH` (on UNIX-y systems, /usr/local/bin or the like).
-Make sure it has execution bits turned on.
+[asdf](https://github.com/asdf-vm/asdf) and [mise](https://github.com/jdx/mise) are quite similar tools you can use to install trivy.
+See their respective documentation for more information of how to install them and use them:
 
-## From source
+- [asdf](https://asdf-vm.com/guide/getting-started.html)
+- [mise](https://mise.jdx.dev/getting-started.html)
 
-```bash
-mkdir -p $GOPATH/src/github.com/aquasecurity
-cd $GOPATH/src/github.com/aquasecurity
-git clone --depth 1 --branch {{ git.tag }} https://github.com/aquasecurity/trivy
-cd trivy/cmd/trivy/
-export GO111MODULE=on
-go install
-```
+The plugin used by both tools is developed [here](https://github.com/zufardhiyaulhaq/asdf-trivy)
 
-## Docker
 
-### Docker Hub
+=== "asdf"
+    A basic global installation is shown below, for specific version or/and local version to a directory see "asdf" documentation.
 
-Replace [YOUR_CACHE_DIR] with the cache directory on your machine.
+    ```shell
+    # Install plugin
+    asdf plugin add trivy https://github.com/zufardhiyaulhaq/asdf-trivy.git
 
-```bash
-docker pull aquasec/trivy:{{ git.tag[1:] }}
-```
+    # Install latest version
+    asdf install trivy latest
 
-Example:
+    # Set a version globally (on your ~/.tool-versions file)
+    asdf global trivy latest
 
-=== "Linux"
-
-    ``` bash
-    docker run --rm -v [YOUR_CACHE_DIR]:/root/.cache/ aquasec/trivy:{{ git.tag[1:] }} image [YOUR_IMAGE_NAME]
+    # Now trivy commands are available
+    trivy --version
     ```
 
-=== "macOS"
+=== "mise"
+    A basic global installation is shown below, for specific version or/and local version to a directory see "mise" documentation.
 
-    ``` bash
-    docker run --rm -v $HOME/Library/Caches:/root/.cache/ aquasec/trivy:{{ git.tag[1:] }} image [YOUR_IMAGE_NAME
+    ``` shell
+    # Install plugin and install latest version
+    mise install trivy@latest
+
+    # Set a version globally (on your ~/.tool-versions file)
+    mise use -g trivy@latest
+
+    # Now trivy commands are available
+    trivy --version
     ```
-
-If you would like to scan the image on your host machine, you need to mount `docker.sock`.
-
-```bash
-docker run --rm -v /var/run/docker.sock:/var/run/docker.sock \
-    -v $HOME/Library/Caches:/root/.cache/ aquasec/trivy:{{ git.tag[1:] }} python:3.4-alpine
-```
-
-Please re-pull latest `aquasec/trivy` if an error occurred.
-
-<details>
-<summary>Result</summary>
-
-```bash
-2019-05-16T01:20:43.180+0900    INFO    Updating vulnerability database...
-2019-05-16T01:20:53.029+0900    INFO    Detecting Alpine vulnerabilities...
-
-python:3.4-alpine3.9 (alpine 3.9.2)
-===================================
-Total: 1 (UNKNOWN: 0, LOW: 0, MEDIUM: 1, HIGH: 0, CRITICAL: 0)
-
-+---------+------------------+----------+-------------------+---------------+--------------------------------+
-| LIBRARY | VULNERABILITY ID | SEVERITY | INSTALLED VERSION | FIXED VERSION |             TITLE              |
-+---------+------------------+----------+-------------------+---------------+--------------------------------+
-| openssl | CVE-2019-1543    | MEDIUM   | 1.1.1a-r1         | 1.1.1b-r1     | openssl: ChaCha20-Poly1305     |
-|         |                  |          |                   |               | with long nonces               |
-+---------+------------------+----------+-------------------+---------------+--------------------------------+
-```
-
-</details>
-
-### GitHub Container Registry
-
-The same image is hosted on [GitHub Container Registry][registry] as well.
-
-```bash
-docker pull ghcr.io/aquasecurity/trivy:{{ git.tag[1:] }}
-```
-
-### Amazon ECR Public
-
-The same image is hosted on [Amazon ECR Public][ecr] as well.
-
-```bash
-docker pull public.ecr.aws/aquasecurity/trivy:{{ git.tag[1:] }}
-```
-
-## Helm
-
-### Installing from the Aqua Chart Repository
-
-```
-helm repo add aquasecurity https://aquasecurity.github.io/helm-charts/
-helm repo update
-helm search repo trivy
-helm install my-trivy aquasecurity/trivy
-```
-
-### Installing the Chart
-
-To install the chart with the release name `my-release`:
-
-```
-helm install my-release .
-```
-
-The command deploys Trivy on the Kubernetes cluster in the default configuration. The [Parameters][helm]
-section lists the parameters that can be configured during installation.
-
-### AWS private registry permissions
-
-You may need to grant permissions to allow trivy to pull images from private registry (AWS ECR).
-
-It depends on how you want to provide AWS Role to trivy.
-
-- [IAM Role Service account](https://github.com/aws/amazon-eks-pod-identity-webhook)
-- [Kube2iam](https://github.com/jtblin/kube2iam) or [Kiam](https://github.com/uswitch/kiam)
-
-#### IAM Role Service account
-
-Add the AWS role in trivy's service account annotations:
-
-```yaml
-trivy:
-
-  serviceAccount:
-    annotations: {}
-      # eks.amazonaws.com/role-arn: arn:aws:iam::ACCOUNT_ID:role/IAM_ROLE_NAME
-```
-
-#### Kube2iam or Kiam
-
-Add the AWS role to pod's annotations:
-
-```yaml
-podAnnotations: {}
-  ## kube2iam/kiam annotation
-  # iam.amazonaws.com/role: arn:aws:iam::ACCOUNT_ID:role/IAM_ROLE_NAME
-```
-
-> **Tip**: List all releases using `helm list`.
-
-[ecr]: https://gallery.ecr.aws/aquasecurity/trivy
-[registry]: https://github.com/orgs/aquasecurity/packages/container/package/trivy
-[helm]: https://github.com/aquasecurity/trivy/tree/{{ git.tag }}/helm/trivy

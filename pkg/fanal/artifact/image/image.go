@@ -2,124 +2,157 @@ package image
 
 import (
 	"context"
-	"encoding/json"
+	"errors"
+	"fmt"
 	"io"
 	"os"
+	"path/filepath"
 	"reflect"
+	"slices"
 	"strings"
 	"sync"
 
+	"github.com/docker/go-units"
 	v1 "github.com/google/go-containerregistry/pkg/v1"
-	"golang.org/x/exp/slices"
-	"golang.org/x/sync/semaphore"
+	"github.com/samber/lo"
 	"golang.org/x/xerrors"
 
+	"github.com/aquasecurity/trivy/pkg/cache"
 	"github.com/aquasecurity/trivy/pkg/fanal/analyzer"
-	"github.com/aquasecurity/trivy/pkg/fanal/analyzer/config"
-	"github.com/aquasecurity/trivy/pkg/fanal/analyzer/secret"
 	"github.com/aquasecurity/trivy/pkg/fanal/artifact"
-	"github.com/aquasecurity/trivy/pkg/fanal/cache"
 	"github.com/aquasecurity/trivy/pkg/fanal/handler"
-	"github.com/aquasecurity/trivy/pkg/fanal/log"
+	"github.com/aquasecurity/trivy/pkg/fanal/image"
 	"github.com/aquasecurity/trivy/pkg/fanal/types"
 	"github.com/aquasecurity/trivy/pkg/fanal/walker"
-)
-
-const (
-	parallel = 5
+	"github.com/aquasecurity/trivy/pkg/log"
+	"github.com/aquasecurity/trivy/pkg/parallel"
+	"github.com/aquasecurity/trivy/pkg/semaphore"
+	trivyTypes "github.com/aquasecurity/trivy/pkg/types"
 )
 
 type Artifact struct {
+	logger         *log.Logger
 	image          types.Image
 	cache          cache.ArtifactCache
 	walker         walker.LayerTar
-	analyzer       analyzer.AnalyzerGroup
+	analyzer       analyzer.AnalyzerGroup       // analyzer for files in container image
+	configAnalyzer analyzer.ConfigAnalyzerGroup // analyzer for container image config
 	handlerManager handler.Manager
 
 	artifactOption artifact.Option
+
+	layerCacheDir string
+}
+
+type LayerInfo struct {
+	DiffID    string
+	CreatedBy string // can be empty
 }
 
 func NewArtifact(img types.Image, c cache.ArtifactCache, opt artifact.Option) (artifact.Artifact, error) {
-	misconf := opt.MisconfScannerOption
-	// Register config analyzers
-	if err := config.RegisterConfigAnalyzers(misconf.FilePatterns); err != nil {
-		return nil, xerrors.Errorf("config scanner error: %w", err)
-	}
-
 	// Initialize handlers
 	handlerManager, err := handler.NewManager(opt)
 	if err != nil {
 		return nil, xerrors.Errorf("handler init error: %w", err)
 	}
 
-	// Register secret analyzer
-	if err = secret.RegisterSecretAnalyzer(opt.SecretScannerOption); err != nil {
-		return nil, xerrors.Errorf("secret scanner error: %w", err)
+	a, err := analyzer.NewAnalyzerGroup(opt.AnalyzerOptions())
+	if err != nil {
+		return nil, xerrors.Errorf("analyzer group error: %w", err)
+	}
+
+	ca, err := analyzer.NewConfigAnalyzerGroup(opt.ConfigAnalyzerOptions())
+	if err != nil {
+		return nil, xerrors.Errorf("config analyzer group error: %w", err)
+	}
+
+	cacheDir, err := os.MkdirTemp("", "layers")
+	if err != nil {
+		return nil, xerrors.Errorf("failed to create a cache layers temp dir: %w", err)
 	}
 
 	return Artifact{
+		logger:         log.WithPrefix("image"),
 		image:          img,
 		cache:          c,
-		walker:         walker.NewLayerTar(opt.SkipFiles, opt.SkipDirs),
-		analyzer:       analyzer.NewAnalyzerGroup(opt.AnalyzerGroup, opt.DisabledAnalyzers),
+		walker:         walker.NewLayerTar(opt.WalkerOption),
+		analyzer:       a,
+		configAnalyzer: ca,
 		handlerManager: handlerManager,
 
 		artifactOption: opt,
+		layerCacheDir:  cacheDir,
 	}, nil
 }
 
-func (a Artifact) Inspect(ctx context.Context) (types.ArtifactReference, error) {
+func (a Artifact) Inspect(ctx context.Context) (ref artifact.Reference, err error) {
 	imageID, err := a.image.ID()
 	if err != nil {
-		return types.ArtifactReference{}, xerrors.Errorf("unable to get the image ID: %w", err)
+		return artifact.Reference{}, xerrors.Errorf("unable to get the image ID: %w", err)
 	}
-
-	diffIDs, err := a.image.LayerIDs()
-	if err != nil {
-		return types.ArtifactReference{}, xerrors.Errorf("unable to get layer IDs: %w", err)
-	}
+	a.logger.Debug("Detected image ID", log.String("image_id", imageID))
 
 	configFile, err := a.image.ConfigFile()
 	if err != nil {
-		return types.ArtifactReference{}, xerrors.Errorf("unable to get the image's config file: %w", err)
+		return artifact.Reference{}, xerrors.Errorf("unable to get the image's config file: %w", err)
 	}
 
-	// Debug
-	log.Logger.Debugf("Image ID: %s", imageID)
-	log.Logger.Debugf("Diff IDs: %v", diffIDs)
+	diffIDs := a.diffIDs(configFile)
+	a.logger.Debug("Detected diff ID", log.Any("diff_ids", diffIDs))
+
+	defer func() {
+		if rerr := os.RemoveAll(a.layerCacheDir); rerr != nil {
+			log.Error("Failed to remove layer cache", log.Err(rerr))
+		}
+	}()
+	if err := a.checkImageSize(ctx, diffIDs); err != nil {
+		return artifact.Reference{}, err
+	}
+
+	// Try retrieving a remote SBOM document
+	if res, err := a.retrieveRemoteSBOM(ctx); err == nil {
+		// Found SBOM
+		return res, nil
+	} else if !errors.Is(err, errNoSBOMFound) {
+		// Fail on unexpected error, otherwise it falls into the usual scanning.
+		return artifact.Reference{}, xerrors.Errorf("remote SBOM fetching error: %w", err)
+	}
 
 	// Try to detect base layers.
 	baseDiffIDs := a.guessBaseLayers(diffIDs, configFile)
-	log.Logger.Debugf("Base Layers: %v", baseDiffIDs)
+	a.logger.Debug("Detected base layers", log.Any("diff_ids", baseDiffIDs))
 
 	// Convert image ID and layer IDs to cache keys
-	imageKey, layerKeys, layerKeyMap, err := a.calcCacheKeys(imageID, diffIDs)
+	imageKey, layerKeys, err := a.calcCacheKeys(imageID, diffIDs)
 	if err != nil {
-		return types.ArtifactReference{}, err
+		return artifact.Reference{}, err
 	}
+
+	// Parse histories and extract a list of "created_by"
+	layerKeyMap := a.consolidateCreatedBy(diffIDs, layerKeys, configFile)
 
 	missingImage, missingLayers, err := a.cache.MissingBlobs(imageKey, layerKeys)
 	if err != nil {
-		return types.ArtifactReference{}, xerrors.Errorf("unable to get missing layers: %w", err)
+		return artifact.Reference{}, xerrors.Errorf("unable to get missing layers: %w", err)
 	}
 
 	missingImageKey := imageKey
 	if missingImage {
-		log.Logger.Debugf("Missing image ID in cache: %s", imageID)
+		a.logger.Debug("Missing image ID in cache", log.String("image_id", imageID))
 	} else {
 		missingImageKey = ""
 	}
 
-	if err = a.inspect(ctx, missingImageKey, missingLayers, baseDiffIDs, layerKeyMap); err != nil {
-		return types.ArtifactReference{}, xerrors.Errorf("analyze error: %w", err)
+	if err = a.inspect(ctx, missingImageKey, missingLayers, baseDiffIDs, layerKeyMap, configFile); err != nil {
+		return artifact.Reference{}, xerrors.Errorf("analyze error: %w", err)
 	}
 
-	return types.ArtifactReference{
+	return artifact.Reference{
 		Name:    a.image.Name(),
-		Type:    types.ArtifactContainerImage,
+		Type:    artifact.TypeContainerImage,
 		ID:      imageKey,
 		BlobIDs: layerKeys,
-		ImageMetadata: types.ImageMetadata{
+		ImageMetadata: artifact.ImageMetadata{
 			ID:          imageID,
 			DiffIDs:     diffIDs,
 			RepoTags:    a.image.RepoTags(),
@@ -129,101 +162,246 @@ func (a Artifact) Inspect(ctx context.Context) (types.ArtifactReference, error) 
 	}, nil
 }
 
-func (Artifact) Clean(_ types.ArtifactReference) error {
+func (a Artifact) Clean(_ artifact.Reference) error {
 	return nil
 }
 
-func (a Artifact) calcCacheKeys(imageID string, diffIDs []string) (string, []string, map[string]string, error) {
+func (a Artifact) calcCacheKeys(imageID string, diffIDs []string) (string, []string, error) {
 	// Pass an empty config scanner option so that the cache key can be the same, even when policies are updated.
-	imageKey, err := cache.CalcKey(imageID, a.analyzer.ImageConfigAnalyzerVersions(), nil, artifact.Option{})
+	imageKey, err := cache.CalcKey(imageID, a.configAnalyzer.AnalyzerVersions(), nil, artifact.Option{})
 	if err != nil {
-		return "", nil, nil, err
+		return "", nil, err
 	}
 
-	layerKeyMap := map[string]string{}
 	hookVersions := a.handlerManager.Versions()
 	var layerKeys []string
 	for _, diffID := range diffIDs {
 		blobKey, err := cache.CalcKey(diffID, a.analyzer.AnalyzerVersions(), hookVersions, a.artifactOption)
 		if err != nil {
-			return "", nil, nil, err
+			return "", nil, err
 		}
 		layerKeys = append(layerKeys, blobKey)
-		layerKeyMap[blobKey] = diffID
 	}
-	return imageKey, layerKeys, layerKeyMap, nil
+	return imageKey, layerKeys, nil
 }
 
-func (a Artifact) inspect(ctx context.Context, missingImage string, layerKeys, baseDiffIDs []string, layerKeyMap map[string]string) error {
-	done := make(chan struct{})
-	errCh := make(chan error)
-
-	var osFound types.OS
-	for _, k := range layerKeys {
-		go func(ctx context.Context, layerKey string) {
-			diffID := layerKeyMap[layerKey]
-
-			// If it is a base layer, secret scanning should not be performed.
-			var disabledAnalyers []analyzer.Type
-			if slices.Contains(baseDiffIDs, diffID) {
-				disabledAnalyers = append(disabledAnalyers, analyzer.TypeSecret)
-			}
-
-			layerInfo, err := a.inspectLayer(ctx, diffID, disabledAnalyers)
-			if err != nil {
-				errCh <- xerrors.Errorf("failed to analyze layer: %s : %w", diffID, err)
-				return
-			}
-			if err = a.cache.PutBlob(layerKey, layerInfo); err != nil {
-				errCh <- xerrors.Errorf("failed to store layer: %s in cache: %w", layerKey, err)
-				return
-			}
-			if layerInfo.OS != nil {
-				osFound = *layerInfo.OS
-			}
-			done <- struct{}{}
-		}(ctx, k)
+func (a Artifact) consolidateCreatedBy(diffIDs, layerKeys []string, configFile *v1.ConfigFile) map[string]LayerInfo {
+	// save createdBy fields in order of layers
+	var createdBy []string
+	for _, h := range configFile.History {
+		// skip histories for empty layers
+		if h.EmptyLayer {
+			continue
+		}
+		c := strings.TrimPrefix(h.CreatedBy, "/bin/sh -c ")
+		c = strings.TrimPrefix(c, "#(nop) ")
+		createdBy = append(createdBy, c)
 	}
 
-	for range layerKeys {
-		select {
-		case <-done:
-		case err := <-errCh:
-			return err
-		case <-ctx.Done():
-			return xerrors.Errorf("timeout: %w", ctx.Err())
+	// If history detected incorrect - use only diffID
+	// TODO: our current logic may not detect empty layers correctly in rare cases.
+	validCreatedBy := len(diffIDs) == len(createdBy)
+
+	layerKeyMap := make(map[string]LayerInfo)
+	for i, diffID := range diffIDs {
+
+		c := ""
+		if validCreatedBy {
+			c = createdBy[i]
 		}
+
+		layerKey := layerKeys[i]
+		layerKeyMap[layerKey] = LayerInfo{
+			DiffID:    diffID,
+			CreatedBy: c,
+		}
+	}
+	return layerKeyMap
+}
+
+func (a Artifact) imageSizeError(typ string, size int64) error {
+	return &trivyTypes.UserError{
+		Message: fmt.Sprintf(
+			"%s size %s exceeds maximum allowed size %s", typ,
+			units.HumanSizeWithPrecision(float64(size), 3),
+			units.HumanSize(float64(a.artifactOption.ImageOption.MaxImageSize)),
+		),
+	}
+}
+
+func (a Artifact) checkImageSize(ctx context.Context, diffIDs []string) error {
+	if a.artifactOption.ImageOption.MaxImageSize == 0 {
+		return nil
+	}
+
+	if err := a.checkCompressedImageSize(diffIDs); err != nil {
+		return xerrors.Errorf("failed to get compressed image size: %w", err)
+	}
+
+	if err := a.checkUncompressedImageSize(ctx, diffIDs); err != nil {
+		return xerrors.Errorf("failed to calculate image size: %w", err)
+	}
+	return nil
+}
+
+func (a Artifact) checkCompressedImageSize(diffIDs []string) error {
+	var totalSize int64
+
+	for _, diffID := range diffIDs {
+		h, err := v1.NewHash(diffID)
+		if err != nil {
+			return xerrors.Errorf("invalid layer ID (%s): %w", diffID, err)
+		}
+
+		layer, err := a.image.LayerByDiffID(h)
+		if err != nil {
+			return xerrors.Errorf("failed to get the layer (%s): %w", diffID, err)
+		}
+		layerSize, err := layer.Size()
+		if err != nil {
+			return xerrors.Errorf("failed to get layer size: %w", err)
+		}
+		totalSize += layerSize
+	}
+
+	if totalSize > a.artifactOption.ImageOption.MaxImageSize {
+		return a.imageSizeError("compressed image", totalSize)
+	}
+
+	return nil
+}
+
+func (a Artifact) checkUncompressedImageSize(ctx context.Context, diffIDs []string) error {
+	var totalSize int64
+
+	p := parallel.NewPipeline(a.artifactOption.Parallel, false, diffIDs,
+		func(_ context.Context, diffID string) (int64, error) {
+			layerSize, err := a.saveLayer(diffID)
+			if err != nil {
+				return -1, xerrors.Errorf("failed to save layer: %w", err)
+			}
+			return layerSize, nil
+		},
+		func(layerSize int64) error {
+			totalSize += layerSize
+			if totalSize > a.artifactOption.ImageOption.MaxImageSize {
+				return a.imageSizeError("uncompressed layers", totalSize)
+			}
+			return nil
+		},
+	)
+
+	if err := p.Do(ctx); err != nil {
+		return xerrors.Errorf("pipeline error: %w", err)
+	}
+
+	return nil
+}
+
+func (a Artifact) saveLayer(diffID string) (int64, error) {
+	a.logger.Debug("Pulling the layer to the local cache", log.String("diff_id", diffID))
+	_, rc, err := a.uncompressedLayer(diffID)
+	if err != nil {
+		return -1, xerrors.Errorf("unable to get uncompressed layer %s: %w", diffID, err)
+	}
+	defer rc.Close()
+
+	f, err := os.Create(filepath.Join(a.layerCacheDir, diffID))
+	if err != nil {
+		return -1, xerrors.Errorf("failed to create a file: %w", err)
+	}
+	defer f.Close()
+
+	return io.Copy(f, rc)
+}
+
+func (a Artifact) inspect(ctx context.Context, missingImage string, layerKeys, baseDiffIDs []string,
+	layerKeyMap map[string]LayerInfo, configFile *v1.ConfigFile) error {
+
+	var osFound types.OS
+	p := parallel.NewPipeline(a.artifactOption.Parallel, false, layerKeys, func(ctx context.Context,
+		layerKey string) (any, error) {
+		layer := layerKeyMap[layerKey]
+
+		// If it is a base layer, secret scanning should not be performed.
+		var disabledAnalyzers []analyzer.Type
+		if slices.Contains(baseDiffIDs, layer.DiffID) {
+			disabledAnalyzers = append(disabledAnalyzers, analyzer.TypeSecret)
+		}
+
+		layerInfo, err := a.inspectLayer(ctx, layer, disabledAnalyzers)
+		if err != nil {
+			return nil, xerrors.Errorf("failed to analyze layer (%s): %w", layer.DiffID, err)
+		}
+		if err = a.cache.PutBlob(layerKey, layerInfo); err != nil {
+			return nil, xerrors.Errorf("failed to store layer: %s in cache: %w", layerKey, err)
+		}
+		if lo.IsNotEmpty(layerInfo.OS) {
+			osFound = layerInfo.OS
+		}
+		return nil, nil
+
+	}, nil)
+
+	if err := p.Do(ctx); err != nil {
+		return xerrors.Errorf("pipeline error: %w", err)
 	}
 
 	if missingImage != "" {
-		if err := a.inspectConfig(missingImage, osFound); err != nil {
+		if err := a.inspectConfig(ctx, missingImage, osFound, configFile); err != nil {
 			return xerrors.Errorf("unable to analyze config: %w", err)
 		}
 	}
 
 	return nil
-
 }
 
-func (a Artifact) inspectLayer(ctx context.Context, diffID string, disabled []analyzer.Type) (types.BlobInfo, error) {
-	log.Logger.Debugf("Missing diff ID in cache: %s", diffID)
+func (a Artifact) inspectLayer(ctx context.Context, layerInfo LayerInfo, disabled []analyzer.Type) (types.BlobInfo, error) {
+	a.logger.Debug("Missing diff ID in cache", log.String("diff_id", layerInfo.DiffID))
 
-	layerDigest, r, err := a.uncompressedLayer(diffID)
+	layerDigest, rc, err := a.uncompressedLayer(layerInfo.DiffID)
 	if err != nil {
-		return types.BlobInfo{}, xerrors.Errorf("unable to get uncompressed layer %s: %w", diffID, err)
+		return types.BlobInfo{}, xerrors.Errorf("unable to get uncompressed layer %s: %w", layerInfo.DiffID, err)
 	}
+	defer rc.Close()
 
 	// Prepare variables
 	var wg sync.WaitGroup
-	opts := analyzer.AnalysisOptions{Offline: a.artifactOption.Offline}
+	opts := analyzer.AnalysisOptions{
+		Offline:      a.artifactOption.Offline,
+		FileChecksum: a.artifactOption.FileChecksum,
+	}
 	result := analyzer.NewAnalysisResult()
-	limit := semaphore.NewWeighted(parallel)
+	limit := semaphore.New(a.artifactOption.Parallel)
+
+	// Prepare filesystem for post analysis
+	composite, err := a.analyzer.PostAnalyzerFS()
+	if err != nil {
+		return types.BlobInfo{}, xerrors.Errorf("unable to get post analysis filesystem: %w", err)
+	}
+	defer composite.Cleanup()
 
 	// Walk a tar layer
-	opqDirs, whFiles, err := a.walker.Walk(r, func(filePath string, info os.FileInfo, opener analyzer.Opener) error {
+	opqDirs, whFiles, err := a.walker.Walk(rc, func(filePath string, info os.FileInfo, opener analyzer.Opener) error {
 		if err = a.analyzer.AnalyzeFile(ctx, &wg, limit, result, "", filePath, info, opener, disabled, opts); err != nil {
 			return xerrors.Errorf("failed to analyze %s: %w", filePath, err)
 		}
+
+		// Skip post analysis if the file is not required
+		analyzerTypes := a.analyzer.RequiredPostAnalyzers(filePath, info)
+		if len(analyzerTypes) == 0 {
+			return nil
+		}
+
+		// Build filesystem for post analysis
+		tmpFilePath, err := composite.CopyFileToTemp(opener, info)
+		if err != nil {
+			return xerrors.Errorf("failed to copy file to temp: %w", err)
+		}
+		if err = composite.CreateLink(analyzerTypes, "", filePath, tmpFilePath); err != nil {
+			return xerrors.Errorf("failed to write a file: %w", err)
+		}
+
 		return nil
 	})
 	if err != nil {
@@ -233,22 +411,29 @@ func (a Artifact) inspectLayer(ctx context.Context, diffID string, disabled []an
 	// Wait for all the goroutine to finish.
 	wg.Wait()
 
+	// Post-analysis
+	if err = a.analyzer.PostAnalyze(ctx, composite, result, opts); err != nil {
+		return types.BlobInfo{}, xerrors.Errorf("post analysis error: %w", err)
+	}
+
 	// Sort the analysis result for consistent results
 	result.Sort()
 
 	blobInfo := types.BlobInfo{
-		SchemaVersion:   types.BlobJSONSchemaVersion,
-		Digest:          layerDigest,
-		DiffID:          diffID,
-		OS:              result.OS,
-		Repository:      result.Repository,
-		PackageInfos:    result.PackageInfos,
-		Applications:    result.Applications,
-		Secrets:         result.Secrets,
-		Licenses:        result.Licenses,
-		OpaqueDirs:      opqDirs,
-		WhiteoutFiles:   whFiles,
-		CustomResources: result.CustomResources,
+		SchemaVersion:     types.BlobJSONSchemaVersion,
+		Digest:            layerDigest,
+		DiffID:            layerInfo.DiffID,
+		CreatedBy:         layerInfo.CreatedBy,
+		OpaqueDirs:        opqDirs,
+		WhiteoutFiles:     whFiles,
+		OS:                result.OS,
+		Repository:        result.Repository,
+		PackageInfos:      result.PackageInfos,
+		Applications:      result.Applications,
+		Misconfigurations: result.Misconfigurations,
+		Secrets:           result.Secrets,
+		Licenses:          result.Licenses,
+		CustomResources:   result.CustomResources,
 
 		// For Red Hat
 		BuildInfo: result.BuildInfo,
@@ -262,7 +447,16 @@ func (a Artifact) inspectLayer(ctx context.Context, diffID string, disabled []an
 	return blobInfo, nil
 }
 
-func (a Artifact) uncompressedLayer(diffID string) (string, io.Reader, error) {
+func (a Artifact) diffIDs(configFile *v1.ConfigFile) []string {
+	if configFile == nil {
+		return nil
+	}
+	return lo.Map(configFile.RootFS.DiffIDs, func(diffID v1.Hash, _ int) string {
+		return diffID.String()
+	})
+}
+
+func (a Artifact) uncompressedLayer(diffID string) (string, io.ReadCloser, error) {
 	// diffID is a hash of the uncompressed layer
 	h, err := v1.NewHash(diffID)
 	if err != nil {
@@ -284,11 +478,17 @@ func (a Artifact) uncompressedLayer(diffID string) (string, io.Reader, error) {
 		digest = d.String()
 	}
 
-	r, err := layer.Uncompressed()
+	f, err := os.Open(filepath.Join(a.layerCacheDir, diffID))
+	if err == nil {
+		a.logger.Debug("Loaded the layer from the local cache", log.String("diff_id", diffID))
+		return digest, f, nil
+	}
+
+	rc, err := layer.Uncompressed()
 	if err != nil {
 		return "", nil, xerrors.Errorf("failed to get the layer content (%s): %w", diffID, err)
 	}
-	return digest, r, nil
+	return digest, rc, nil
 }
 
 // ref. https://github.com/google/go-containerregistry/issues/701
@@ -297,90 +497,34 @@ func (a Artifact) isCompressed(l v1.Layer) bool {
 	return !uncompressed
 }
 
-func (a Artifact) inspectConfig(imageID string, osFound types.OS) error {
-	configBlob, err := a.image.RawConfigFile()
-	if err != nil {
-		return xerrors.Errorf("unable to get config blob: %w", err)
-	}
-
-	pkgs := a.analyzer.AnalyzeImageConfig(osFound, configBlob)
-
-	var s1 v1.ConfigFile
-	if err = json.Unmarshal(configBlob, &s1); err != nil {
-		return xerrors.Errorf("json marshal error: %w", err)
-	}
+func (a Artifact) inspectConfig(ctx context.Context, imageID string, osFound types.OS, config *v1.ConfigFile) error {
+	result := lo.FromPtr(a.configAnalyzer.AnalyzeImageConfig(ctx, osFound, config))
 
 	info := types.ArtifactInfo{
-		SchemaVersion:   types.ArtifactJSONSchemaVersion,
-		Architecture:    s1.Architecture,
-		Created:         s1.Created.Time,
-		DockerVersion:   s1.DockerVersion,
-		OS:              s1.OS,
-		HistoryPackages: pkgs,
+		SchemaVersion:    types.ArtifactJSONSchemaVersion,
+		Architecture:     config.Architecture,
+		Created:          config.Created.Time,
+		DockerVersion:    config.DockerVersion,
+		OS:               config.OS,
+		Misconfiguration: result.Misconfiguration,
+		Secret:           result.Secret,
+		HistoryPackages:  result.HistoryPackages,
 	}
 
-	if err = a.cache.PutArtifact(imageID, info); err != nil {
+	if err := a.cache.PutArtifact(imageID, info); err != nil {
 		return xerrors.Errorf("failed to put image info into the cache: %w", err)
 	}
 
 	return nil
 }
 
-// Guess layers in base image (call base layers).
-//
-// e.g. In the following example, we should detect layers in debian:8.
-//   FROM debian:8
-//   RUN apt-get update
-//   COPY mysecret /
-//   ENTRYPOINT ["entrypoint.sh"]
-//   CMD ["somecmd"]
-//
-// debian:8 may be like
-//   ADD file:5d673d25da3a14ce1f6cf66e4c7fd4f4b85a3759a9d93efb3fd9ff852b5b56e4 in /
-//   CMD ["/bin/sh"]
-//
-// In total, it would be like:
-//   ADD file:5d673d25da3a14ce1f6cf66e4c7fd4f4b85a3759a9d93efb3fd9ff852b5b56e4 in /
-//   CMD ["/bin/sh"]              # empty layer (detected)
-//   RUN apt-get update
-//   COPY mysecret /
-//   ENTRYPOINT ["entrypoint.sh"] # empty layer (skipped)
-//   CMD ["somecmd"]              # empty layer (skipped)
-//
-// This method tries to detect CMD in the second line and assume the first line is a base layer.
-//   1. Iterate histories from the bottom.
-//   2. Skip all the empty layers at the bottom. In the above example, "entrypoint.sh" and "somecmd" will be skipped
-//   3. If it finds CMD, it assumes that it is the end of base layers.
-//   4. It gets all the layers as base layers above the CMD found in #3.
+// guessBaseLayers guesses layers in base image (call base layers).
 func (a Artifact) guessBaseLayers(diffIDs []string, configFile *v1.ConfigFile) []string {
 	if configFile == nil {
 		return nil
 	}
 
-	var baseImageIndex int
-	var foundNonEmpty bool
-	for i := len(configFile.History) - 1; i >= 0; i-- {
-		h := configFile.History[i]
-
-		// Skip the last CMD, ENTRYPOINT, etc.
-		if !foundNonEmpty {
-			if h.EmptyLayer {
-				continue
-			}
-			foundNonEmpty = true
-		}
-
-		if !h.EmptyLayer {
-			continue
-		}
-
-		// Detect CMD instruction in base image
-		if strings.HasPrefix(h.CreatedBy, "/bin/sh -c #(nop)  CMD") ||
-			strings.HasPrefix(h.CreatedBy, "CMD") { // BuildKit
-			baseImageIndex = i
-			break
-		}
-	}
+	baseImageIndex := image.GuessBaseImageIndex(configFile.History)
 
 	// Diff IDs don't include empty layers, so the index is different from histories
 	var diffIDIndex int

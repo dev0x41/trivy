@@ -3,38 +3,48 @@ package applier
 import (
 	"golang.org/x/xerrors"
 
+	"github.com/aquasecurity/trivy/pkg/cache"
 	"github.com/aquasecurity/trivy/pkg/fanal/analyzer"
-	"github.com/aquasecurity/trivy/pkg/fanal/cache"
-	"github.com/aquasecurity/trivy/pkg/fanal/types"
+	ftypes "github.com/aquasecurity/trivy/pkg/fanal/types"
 )
 
-type Applier struct {
+// Applier defines operation to scan image layers
+type Applier interface {
+	ApplyLayers(artifactID string, blobIDs []string) (detail ftypes.ArtifactDetail, err error)
+}
+
+type applier struct {
 	cache cache.LocalArtifactCache
 }
 
 func NewApplier(c cache.LocalArtifactCache) Applier {
-	return Applier{cache: c}
+	return &applier{cache: c}
 }
 
-func (a Applier) ApplyLayers(imageID string, layerKeys []string) (types.ArtifactDetail, error) {
-	var layers []types.BlobInfo
+func (a *applier) ApplyLayers(imageID string, layerKeys []string) (ftypes.ArtifactDetail, error) {
+	var layers []ftypes.BlobInfo
 	for _, key := range layerKeys {
 		blob, _ := a.cache.GetBlob(key) // nolint
 		if blob.SchemaVersion == 0 {
-			return types.ArtifactDetail{}, xerrors.Errorf("layer cache missing: %s", key)
+			return ftypes.ArtifactDetail{}, xerrors.Errorf("layer cache missing: %s", key)
 		}
 		layers = append(layers, blob)
 	}
 
 	mergedLayer := ApplyLayers(layers)
-	if mergedLayer.OS == nil {
+
+	imageInfo, _ := a.cache.GetArtifact(imageID) // nolint
+	mergedLayer.ImageConfig = ftypes.ImageConfigDetail{
+		Packages:         imageInfo.HistoryPackages,
+		Misconfiguration: imageInfo.Misconfiguration,
+		Secret:           imageInfo.Secret,
+	}
+
+	if !mergedLayer.OS.Detected() {
 		return mergedLayer, analyzer.ErrUnknownOS // send back package and apps info regardless
 	} else if mergedLayer.Packages == nil {
 		return mergedLayer, analyzer.ErrNoPkgsDetected // send back package and apps info regardless
 	}
-
-	imageInfo, _ := a.cache.GetArtifact(imageID) // nolint
-	mergedLayer.HistoryPackages = imageInfo.HistoryPackages
 
 	return mergedLayer, nil
 }

@@ -1,22 +1,27 @@
 package secret
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"io"
-	"math"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 
-	"golang.org/x/exp/slices"
+	"github.com/samber/lo"
 	"golang.org/x/xerrors"
 
-	dio "github.com/aquasecurity/go-dep-parser/pkg/io"
 	"github.com/aquasecurity/trivy/pkg/fanal/analyzer"
 	"github.com/aquasecurity/trivy/pkg/fanal/secret"
 	"github.com/aquasecurity/trivy/pkg/fanal/types"
+	"github.com/aquasecurity/trivy/pkg/fanal/utils"
+	"github.com/aquasecurity/trivy/pkg/log"
 )
+
+// To make sure SecretAnalyzer implements analyzer.Initializer
+var _ analyzer.Initializer = &SecretAnalyzer{}
 
 const version = 1
 
@@ -30,15 +35,39 @@ var (
 		"Pipfile.lock",
 		"Gemfile.lock",
 	}
-	skipDirs = []string{".git", "node_modules"}
+	skipDirs = []string{
+		".git",
+		"node_modules",
+	}
 	skipExts = []string{
-		".jpg", ".png", ".gif", ".doc", ".pdf", ".bin", ".svg", ".socket", ".deb", ".rpm",
-		".zip", ".gz", ".gzip", ".tar", ".pyc",
+		".jpg",
+		".png",
+		".gif",
+		".doc",
+		".pdf",
+		".bin",
+		".svg",
+		".socket",
+		".deb",
+		".rpm",
+		".zip",
+		".gz",
+		".gzip",
+		".tar",
+	}
+
+	allowedBinaries = []string{
+		".pyc",
 	}
 )
 
-type ScannerOption struct {
-	ConfigPath string
+func init() {
+	// The scanner will be initialized later via InitScanner()
+	analyzer.RegisterAnalyzer(NewSecretAnalyzer(secret.Scanner{}, ""))
+}
+
+func allowedBinary(filename string) bool {
+	return slices.Contains(allowedBinaries, filepath.Ext(filename))
 }
 
 // SecretAnalyzer is an analyzer for secrets
@@ -47,36 +76,54 @@ type SecretAnalyzer struct {
 	configPath string
 }
 
-func RegisterSecretAnalyzer(opt ScannerOption) error {
-	a, err := newSecretAnalyzer(opt.ConfigPath)
-	if err != nil {
-		return xerrors.Errorf("secret scanner init error: %w", err)
+func NewSecretAnalyzer(s secret.Scanner, configPath string) *SecretAnalyzer {
+	return &SecretAnalyzer{
+		scanner:    s,
+		configPath: configPath,
 	}
-	analyzer.RegisterAnalyzer(a)
+}
+
+// Init initializes and sets a secret scanner
+func (a *SecretAnalyzer) Init(opt analyzer.AnalyzerOptions) error {
+	if opt.SecretScannerOption.ConfigPath == a.configPath && !lo.IsEmpty(a.scanner) {
+		// This check is for tools importing Trivy and customize analyzers
+		// Never reach here in Trivy OSS
+		return nil
+	}
+	configPath := opt.SecretScannerOption.ConfigPath
+	c, err := secret.ParseConfig(configPath)
+	if err != nil {
+		return xerrors.Errorf("secret config error: %w", err)
+	}
+	a.scanner = secret.NewScanner(c)
+	a.configPath = configPath
 	return nil
 }
 
-func newSecretAnalyzer(configPath string) (SecretAnalyzer, error) {
-	s, err := secret.NewScanner(configPath)
-	if err != nil {
-		return SecretAnalyzer{}, xerrors.Errorf("secret scanner error: %w", err)
-	}
-	return SecretAnalyzer{
-		scanner:    s,
-		configPath: configPath,
-	}, nil
-}
-
-func (a SecretAnalyzer) Analyze(_ context.Context, input analyzer.AnalysisInput) (*analyzer.AnalysisResult, error) {
+func (a *SecretAnalyzer) Analyze(_ context.Context, input analyzer.AnalysisInput) (*analyzer.AnalysisResult, error) {
 	// Do not scan binaries
-	binary, err := isBinary(input.Content, input.Info.Size())
-	if binary || err != nil {
+	binary, err := utils.IsBinary(input.Content, input.Info.Size())
+	if err != nil || (binary && !allowedBinary(input.FilePath)) {
 		return nil, nil
 	}
 
-	content, err := io.ReadAll(input.Content)
-	if err != nil {
-		return nil, xerrors.Errorf("read error %s: %w", input.FilePath, err)
+	if size := input.Info.Size(); size > 10485760 { // 10MB
+		log.WithPrefix("secret").Warn("The size of the scanned file is too large. It is recommended to use `--skip-files` for this file to avoid high memory consumption.", log.FilePath(input.FilePath), log.Int64("size (MB)", size/1048576))
+	}
+
+	var content []byte
+
+	if !binary {
+		content, err = io.ReadAll(input.Content)
+		if err != nil {
+			return nil, xerrors.Errorf("read error %s: %w", input.FilePath, err)
+		}
+		content = bytes.ReplaceAll(content, []byte("\r"), []byte(""))
+	} else {
+		content, err = utils.ExtractPrintableBytes(input.Content)
+		if err != nil {
+			return nil, xerrors.Errorf("binary read error %s: %w", input.FilePath, err)
+		}
 	}
 
 	filePath := input.FilePath
@@ -90,6 +137,7 @@ func (a SecretAnalyzer) Analyze(_ context.Context, input analyzer.AnalysisInput)
 	result := a.scanner.Scan(secret.ScanArgs{
 		FilePath: filePath,
 		Content:  content,
+		Binary:   binary,
 	})
 
 	if len(result.Findings) == 0 {
@@ -101,27 +149,7 @@ func (a SecretAnalyzer) Analyze(_ context.Context, input analyzer.AnalysisInput)
 	}, nil
 }
 
-func isBinary(content dio.ReadSeekerAt, fileSize int64) (bool, error) {
-	headSize := int(math.Min(float64(fileSize), 300))
-	head := make([]byte, headSize)
-	if _, err := content.Read(head); err != nil {
-		return false, err
-	}
-	if _, err := content.Seek(0, io.SeekStart); err != nil {
-		return false, err
-	}
-
-	// cf. https://github.com/file/file/blob/f2a6e7cb7db9b5fd86100403df6b2f830c7f22ba/src/encoding.c#L151-L228
-	for _, b := range head {
-		if b < 7 || b == 11 || (13 < b && b < 27) || (27 < b && b < 0x20) || b == 0x7f {
-			return true, nil
-		}
-	}
-
-	return false, nil
-}
-
-func (a SecretAnalyzer) Required(filePath string, fi os.FileInfo) bool {
+func (a *SecretAnalyzer) Required(filePath string, fi os.FileInfo) bool {
 	// Skip small files
 	if fi.Size() < 10 {
 		return false
@@ -161,10 +189,10 @@ func (a SecretAnalyzer) Required(filePath string, fi os.FileInfo) bool {
 	return true
 }
 
-func (a SecretAnalyzer) Type() analyzer.Type {
+func (a *SecretAnalyzer) Type() analyzer.Type {
 	return analyzer.TypeSecret
 }
 
-func (a SecretAnalyzer) Version() int {
+func (a *SecretAnalyzer) Version() int {
 	return version
 }

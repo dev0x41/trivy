@@ -1,10 +1,41 @@
 {{- /* Template based on https://docs.gitlab.com/ee/user/application_security/container_scanning/#reports-json-format */ -}}
 {
-  "version": "2.3",
+  "version": "15.0.7",
+  "scan": {
+    "analyzer": {
+      "id": "trivy",
+      "name": "Trivy",
+      "vendor": {
+        "name": "Aqua Security"
+      },
+      "version": "{{ appVersion }}"
+    },
+    "end_time": "{{ now | date "2006-01-02T15:04:05" }}",
+    "scanner": {
+      "id": "trivy",
+      "name": "Trivy",
+      "url": "https://github.com/aquasecurity/trivy/",
+      "vendor": {
+        "name": "Aqua Security"
+      },
+      "version": "{{ appVersion }}"
+    },
+    "start_time": "{{ now | date "2006-01-02T15:04:05" }}",
+    "status": "success",
+    "type": "container_scanning"
+  },
+  {{- $image := "Unknown" -}}
+  {{- $os := "Unknown" -}}
+  {{- range . }}
+    {{- if eq .Class "os-pkgs" -}}
+      {{- $target := .Target }}
+        {{- $image = $target | regexFind "[^\\s]+" }}
+        {{- $os = $target | splitList "(" | last | trimSuffix ")" }}
+    {{- end }}
+  {{- end }}
   "vulnerabilities": [
   {{- $t_first := true }}
   {{- range . }}
-  {{- $target := .Target }}
     {{- range .Vulnerabilities -}}
     {{- if $t_first -}}
       {{- $t_first = false -}}
@@ -13,11 +44,8 @@
     {{- end }}
     {
       "id": "{{ .VulnerabilityID }}",
-      "category": "container_scanning",
-      "message": {{ .Title | printf "%q" }},
+      "name": {{ .Title | printf "%q" }},
       "description": {{ .Description | printf "%q" }},
-      {{- /* cve is a deprecated key, use id instead */}}
-      "cve": "{{ .VulnerabilityID }}",
       "severity": {{ if eq .Severity "UNKNOWN" -}}
                     "Unknown"
                   {{- else if eq .Severity "LOW" -}}
@@ -31,17 +59,11 @@
                   {{-  else -}}
                     "{{ .Severity }}"
                   {{- end }},
-      {{- /* TODO: Define confidence */}}
-      "confidence": "Unknown",
       "solution": {{ if .FixedVersion -}}
                     "Upgrade {{ .PkgName }} to {{ .FixedVersion }}"
                   {{- else -}}
                     "No solution provided"
                   {{- end }},
-      "scanner": {
-        "id": "trivy",
-        "name": "trivy"
-      },
       "location": {
         "dependency": {
           "package": {
@@ -50,16 +72,19 @@
           "version": "{{ .InstalledVersion }}"
         },
         {{- /* TODO: No mapping available - https://github.com/aquasecurity/trivy/issues/332 */}}
-        "operating_system": "Unknown",
-        "image": "{{ $target }}"
+        "operating_system": "{{ $os }}",
+        "image": "{{ $image }}"
       },
       "identifiers": [
         {
 	  {{- /* TODO: Type not extractable - https://github.com/aquasecurity/trivy-db/pull/24 */}}
           "type": "cve",
           "name": "{{ .VulnerabilityID }}",
-          "value": "{{ .VulnerabilityID }}",
+          "value": "{{ .VulnerabilityID }}"
+          {{- /* cf. https://gitlab.com/gitlab-org/security-products/security-report-schemas/-/blob/e3d280d7f0862ca66a1555ea8b24016a004bb914/dist/container-scanning-report-format.json#L157-179 */}}
+          {{- if .PrimaryURL | regexMatch "^(https?|ftp)://.+" -}},
           "url": "{{ .PrimaryURL }}"
+          {{- end }}
         }
       ],
       "links": [
@@ -70,9 +95,13 @@
         {{- else -}}
           ,
         {{- end -}}
+        {{- if . | regexMatch "^(https?|ftp)://.+" -}}
         {
           "url": "{{ . }}"
         }
+        {{- else -}}
+          {{- $l_first = true }}
+        {{- end -}}
         {{- end }}
       ]
     }

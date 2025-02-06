@@ -23,7 +23,7 @@ func Test_rockyOSAnalyzer_Analyze(t *testing.T) {
 			name:      "happy path",
 			inputFile: "testdata/rocky/rocky-release",
 			want: &analyzer.AnalysisResult{
-				OS: &types.OS{Family: "rocky", Name: "8.4"},
+				OS: types.OS{Family: "rocky", Name: "8.4"},
 			},
 		},
 		{
@@ -45,8 +45,7 @@ func Test_rockyOSAnalyzer_Analyze(t *testing.T) {
 				Content:  f,
 			})
 			if tt.wantErr != "" {
-				require.Error(t, err)
-				assert.Contains(t, err.Error(), tt.wantErr)
+				require.ErrorContains(t, err, tt.wantErr)
 				return
 			}
 			require.NoError(t, err)
